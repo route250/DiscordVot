@@ -7,10 +7,12 @@ import numpy as np
 import requests
 from requests.adapters import HTTPAdapter
 import httpx
+import asyncio
+from typing import Optional, Tuple
 
 sys.path.append(os.getcwd())
 from rec_util import AudioF32, load_wave
-from net_utils import find_first_responsive_host
+from net_utils import a_find_first_responsive_host, find_first_responsive_host
 # from ..translate import convert_to_katakana, convert_kuten
 
 from logging import getLogger
@@ -152,6 +154,11 @@ class TtsEngine:
         self._voicevox_list = list(set([os.getenv('VOICEVOX_HOST','127.0.0.1'),'127.0.0.1','192.168.0.104','chickennanban.ddns.net','chickennanban1.ddns.net','chickennanban2.ddns.net','chickennanban3.ddns.net']))
         self._katakana_dir = katakana_dir
 
+    async def a_get_voicevox_url( self ) ->str|None:
+        if self._voicevox_url is None:
+            self._voicevox_url = await a_find_first_responsive_host(self._voicevox_list,self._voicevox_port)
+        return self._voicevox_url
+
     def _get_voicevox_url( self ) ->str|None:
         if self._voicevox_url is None:
             self._voicevox_url = find_first_responsive_host(self._voicevox_list,self._voicevox_port)
@@ -198,7 +205,59 @@ class TtsEngine:
             return default # VOICEVOX,OpenAI,gTTSで、エラーにならない無音文字列
         else:
             return text
+
+    async def a_text_to_audio_by_voicevox(self, text: str, *, sampling_rate: int) -> Tuple[Optional["AudioF32"], Optional[str]]:
+        sv_url: Optional[str] = await self.a_get_voicevox_url()
+        if sv_url is None:
+            return None, None
+        try:
+            # textの変換処理
+            text = TtsEngine.__penpenpen(text, ' ')
+            timeout = httpx.Timeout(5.0, read=180.0)
+            params = {'text': text, 'speaker': self.speaker}
+            
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                # audio_queryエンドポイントへのPOSTリクエスト
+                res1 = await client.post(f'{sv_url}/audio_query', params=params)
+                res1.raise_for_status()
+                res1_json = res1.json()
+
+                # パラメータの調整
+                ss: float = res1_json.get('speedScale', 1.0)
+                res1_json['speedScale'] = ss * 1.1
+                ps: float = res1_json.get('pitchScale', 0.0)
+                res1_json['pitchScale'] = ps - 0.1
+
+                # synthesisエンドポイントへのPOSTリクエスト
+                data = json.dumps(res1_json, ensure_ascii=False)
+                headers = {'content-type': 'application/json'}
+                res = await client.post(
+                    f'{sv_url}/synthesis',
+                    json=res1_json,
+                    params={'speaker': self.speaker},
+                    headers=headers
+                )
+                res.raise_for_status()
+
+                # レスポンスを処理
+                if res.status_code == 200:
+                    model: str = TtsEngine.id_to_name(self.speaker)
+                    f32 = load_wave(res.content, sampling_rate=sampling_rate)
+                    return f32, model
+
+                logger.error(f"[VOICEVOX] code:{res.status_code} {res.text}")
+
+        except httpx.ConnectTimeout as ex:
+            logger.error(f"[VOICEVOX] {type(ex)} {ex}")
+        except httpx.RequestError as ex:
+            logger.error(f"[VOICEVOX] {type(ex)} {ex}")
+        except Exception as ex:
+            logger.error(f"[VOICEVOX] {type(ex)} {ex}")
+            logger.exception('')
         
+        self._disable_voicevox = time.time()
+        return None, None
+
     def _text_to_audio_by_voicevox(self, text:str, *, sampling_rate:int) -> tuple[AudioF32|None,str|None]:
         sv_url: str|None = self._get_voicevox_url()
         if sv_url is None:
@@ -247,7 +306,6 @@ class TtsEngine:
     def convert_blank( text:str ) ->str:
         text = re.sub( r'[「」・、。]+',' ',text)
         return text.strip()
-
 
 def main():
     tts:TtsEngine = TtsEngine()

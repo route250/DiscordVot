@@ -2,7 +2,7 @@ import sys,os,io
 import asyncio
 from asyncio import Task
 from queue import Queue
-from typing import NamedTuple
+from typing import Type, Optional, NamedTuple
 import json
 
 from dotenv import load_dotenv
@@ -19,19 +19,32 @@ sys.path.append(os.getcwd())
 from rec_util import AudioF32, load_wave
 from text_to_voice import TtsEngine
 
+
+class sessionId(NamedTuple):
+    gid:int # guild id
+    cid:int # channel id
+
+    @staticmethod
+    def from_ctx(ctx:ApplicationContext|None) ->Optional["sessionId"]:
+        if isinstance(ctx,ApplicationContext):
+            gid = ctx.guild_id
+            cid = ctx.channel_id
+            if gid and cid:
+                return sessionId(gid,cid)
+        return None
+
 class Ukey(NamedTuple):
-    gid:int
+    sid:sessionId
     uid:int
 
 class AudioSeg(NamedTuple):
     ukey:Ukey
-    ctx:ApplicationContext
     data:NDArray[np.float32]
 
 class BufSink(Sink):
-    def __init__(self, ctx:ApplicationContext, *, filters=None):
+    def __init__(self, sid:sessionId, *, filters=None):
         super().__init__( filters=filters)
-        self.ctx:ApplicationContext = ctx
+        self.sid:sessionId = sid
         self.sample_rate:int = 48000
         self.ch:int = 2
         self.sz:int = 2
@@ -54,13 +67,10 @@ class BufSink(Sink):
         i2 = i16.reshape((frames,self.ch))
         i1 = i2[:,0]
         f32 = i1.astype(np.float32) / 32768.0
-        self.data_q.put(AudioSeg(Ukey(self.ctx.guild_id,user),self.ctx,f32))
+        self.data_q.put(AudioSeg(Ukey(self.sid,user),f32))
 
     def cleanup(self):
         super().cleanup()
-
-    def qsize(self) ->int:
-        return self.data_q.qsize()
 
     def get_nowait(self) ->AudioSeg|None:
         try:
@@ -75,6 +85,17 @@ class BufSink(Sink):
 
     # def get_user_audio(self, user: snowflake.Snowflake):
     #     return None
+
+class BotSession:
+
+    def __init__(self, ctx:ApplicationContext):
+        sid:sessionId|None = sessionId.from_ctx(ctx)
+        if sid is None:
+            raise ValueError("can not get sessionId from context")
+        self.sid:sessionId = sid
+        self.ctx:ApplicationContext = ctx
+
+
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 IGNORE2="{\n  \"text\" : \"\"\n}"
 IGNORE1="{\n  \"partial\" : \"\"\n}"
@@ -89,8 +110,8 @@ def strip_vosk_text( text:str ) ->str|None:
     return text.replace(' ','')
 
 class UserVosk:
-    def __init__(self,ctx:ApplicationContext, model,sr):
-        self.ctx:ApplicationContext = ctx
+    def __init__(self,ukey:Ukey, model,sr):
+        self.ukey:Ukey = ukey
         self.recog = vosk.KaldiRecognizer( model, sr )
         self._drty:bool = False
 
@@ -119,6 +140,9 @@ class MyBot(discord.Bot):
     def __init__(self):
         super().__init__()
         self._add_commands()
+        # session
+        self._session_map:dict[sessionId,BotSession] = {}
+        #
         self.vosk_task:Task|None = None
         self.buf:BufSink|None = None
         self.vc:discord.VoiceClient|None = None
@@ -130,6 +154,21 @@ class MyBot(discord.Bot):
         #
         self.tts:TtsEngine = TtsEngine()
 
+    def _get_session(self, ctx:ApplicationContext|sessionId|None) -> BotSession|None:
+        if isinstance(ctx,sessionId):
+            return self._session_map.get(ctx)
+        if not isinstance(ctx,ApplicationContext):
+            return None
+        sid:sessionId|None = sessionId.from_ctx(ctx)
+        if sid is None:
+            return None
+        session:BotSession|None = self._session_map.get(sid)
+        if session is not None:
+            return session
+        session = BotSession(ctx)
+        self._session_map[sid] = session
+        return session
+
     def load_vosk_model(self) ->vosk.Model:
         # VOSKモデルの読み込み
         model = self.vosk_model
@@ -140,10 +179,10 @@ class MyBot(discord.Bot):
         return model
 
     async def uid_to_name(self,ukey:Ukey) ->str:
-        guild = self.get_guild(ukey.gid)
+        guild = self.get_guild(ukey.sid.gid)
         if guild is None:
             try:
-                guild = await self.fetch_guild(ukey.gid)
+                guild = await self.fetch_guild(ukey.sid.gid)
             except:
                 guild = None
         if guild is not None:
@@ -198,7 +237,7 @@ class MyBot(discord.Bot):
                         j = json.loads(txt)
                         msg = strip_vosk_text( j.get('text') )
                         if msg:
-                            await self.abc_mesg( recog.ctx, ukey, msg )
+                            await self.abc_mesg( ukey, msg )
                 continue
 
             ukey=seg.ukey
@@ -230,7 +269,7 @@ class MyBot(discord.Bot):
                     j = json.loads(txt)
                     msg = strip_vosk_text( j.get('text') )
                     if msg:
-                        await self.abc_mesg( recog.ctx, ukey, msg )
+                        await self.abc_mesg( ukey, msg )
             # else:
             #     txt = recog.PartialResult()
             #     if txt != IGNORE1:
@@ -239,37 +278,47 @@ class MyBot(discord.Bot):
     def _add_commands(self):
         @self.slash_command(description="ボイスチャンネルに参加します。")
         async def join( ctx:ApplicationContext):
-            print(f"join {type(ctx)}")
-            if ctx.author.voice is None:
-                embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
-                await ctx.respond(embed=embed)
-                return
-            if ctx.guild.voice_client is None or ctx.voice_client is None:
-                try:
-                    await ctx.author.voice.channel.connect()
-                except:
-                    embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続できません。\nボイスチャンネルの権限を確認してください。",color=discord.Colour.red())
+            try:
+                print(f"join {type(ctx)}")
+                session:BotSession|None = self._get_session(ctx)
+                if session is None:
+                    embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
-            if ctx.guild.voice_client is None or ctx.voice_client is None:
-                embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
+                if ctx.author.voice is None:
+                    embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
+                    await ctx.respond(embed=embed)
+                    return
+                if ctx.guild.voice_client is None or ctx.voice_client is None:
+                    try:
+                        await ctx.author.voice.channel.connect()
+                    except:
+                        embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続できません。\nボイスチャンネルの権限を確認してください。",color=discord.Colour.red())
+                        await ctx.respond(embed=embed)
+                        return
+                if ctx.guild.voice_client is None or ctx.voice_client is None:
+                    embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
+                    await ctx.respond(embed=embed)
+                    return
+                self.buf = BufSink(session.sid)
+                ctx.voice_client.start_recording(self.buf, self.vosk_finished_callback, ctx)
+                embed = discord.Embed(title="成功",description="ボイスチャンネルに参加しました。",color=discord.Colour.green())
                 await ctx.respond(embed=embed)
-                return
-            ctx.guild_id
-            self.buf = BufSink(ctx)
-            ctx.voice_client.start_recording(self.buf, self.vosk_finished_callback, ctx)
-            embed = discord.Embed(title="成功",description="ボイスチャンネルに参加しました。",color=discord.Colour.green())
-            await ctx.respond(embed=embed)
+            except Exception as ex:
+                print(f"ERROR {ex}")
 
         @self.slash_command(description="ボイスチャンネルから切断します。")
         async def leave(ctx:ApplicationContext):
-            if ctx.guild.voice_client is None:
-                embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
+            try:
+                if ctx.guild.voice_client is None:
+                    embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
+                    await ctx.respond(embed=embed)
+                    return
+                await ctx.guild.voice_client.disconnect()
+                embed = discord.Embed(title="成功",description="ボイスチャンネルから切断しました。",color=discord.Colour.green())
                 await ctx.respond(embed=embed)
-                return
-            await ctx.guild.voice_client.disconnect()
-            embed = discord.Embed(title="成功",description="ボイスチャンネルから切断しました。",color=discord.Colour.green())
-            await ctx.respond(embed=embed)
+            except Exception as ex:
+                print(f"ERROR {ex}")
 
     async def vosk_finished_callback(self, sink, ctx, *args):
         pass
@@ -279,10 +328,14 @@ class MyBot(discord.Bot):
         files = [discord.File(audio.file, f"{user_id}.{sink.encoding}") for user_id, audio in sink.audio_data.items()]
         await ctx.respond(f"録音が完了しました！\n録音されたユーザー: {', '.join(recorded_users)}.", files=files)
 
-    async def abc_mesg(self, ctx:ApplicationContext, uid:Ukey, mesg ):
-        uname = await self.uid_to_name(uid)
-        print(f"mesg {uid.gid} {uid.uid} {uname} {mesg}")
-        vc:discord.VoiceClient = ctx.guild.voice_client
+    async def abc_mesg(self, ukey:Ukey, mesg ):
+        session:BotSession|None = self._get_session(ukey.sid)
+        if session is None:
+            print("ERROR can not get session")
+            return
+        uname = await self.uid_to_name(ukey)
+        print(f"mesg {ukey.sid.gid} {ukey.uid} {uname} {mesg}")
+        vc:discord.VoiceClient = session.ctx.guild.voice_client
         if vc is None:
             await ctx.respond('ボイスチャンネルに未接続')
             return
@@ -290,7 +343,7 @@ class MyBot(discord.Bot):
 
         # 正弦波の音声データをBytesIOオブジェクトで生成
         #sine_wave_buffer = generate_sine_wave_bytes()
-        f32q, model = self.tts._text_to_audio_by_voicevox( f"あのね、{mesg}ってなんだよ", sampling_rate=48000 )
+        f32q, model = await self.tts.a_text_to_audio_by_voicevox( f"あのね、{mesg}ってなんだよ", sampling_rate=48000 )
         if f32q is None:
             return
         # ステレオに変換（左右チャンネルに同じデータをコピー）
