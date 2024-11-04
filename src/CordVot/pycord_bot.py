@@ -16,7 +16,7 @@ import vosk
 import librosa
 
 sys.path.append(os.getcwd())
-from rec_util import AudioF32, load_wave
+from rec_util import AudioF32, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
 
 
@@ -88,12 +88,70 @@ class BufSink(Sink):
 
 class BotSession:
 
-    def __init__(self, ctx:ApplicationContext):
+    def __init__(self, bot:Type["MyBot"], ctx:ApplicationContext):
+        self.bot:Type["MyBot"] = bot
         sid:sessionId|None = sessionId.from_ctx(ctx)
         if sid is None:
             raise ValueError("can not get sessionId from context")
         self.sid:sessionId = sid
         self.ctx:ApplicationContext = ctx
+
+    def is_voice(self):
+        vc:discord.VoiceClient = self.ctx.guild.voice_client
+        return True if vc is not None else False
+
+    async def get_username(self, uid:int) ->str:
+        guild = self.ctx.guild
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except:
+                member = None
+        if member is not None:
+            return member.display_name
+        return f"@{uid}"
+
+    async def abc_mesg(self, uid:int, mesg:str ):
+
+        username = await self.get_username(uid)
+
+        await self.ctx.respond(f"User: {username} {mesg}")
+
+        ans =  f"あのね、{mesg}ってなんだよ"
+        await self.def_mesg( ans )
+    
+    async def def_mesg(self, ans:str ):
+        f32q:NDArray[np.float32]|None = None
+        if self.is_voice():
+            # 正弦波の音声データをBytesIOオブジェクトで生成
+            #sine_wave_buffer = generate_sine_wave_bytes()
+            f32a, model = await self.bot.tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
+            if f32a is not None:
+                f32q = reverb( compressor(f32a) )
+        else:
+            f32q = None
+        
+        await self.ctx.respond( ans )
+
+        if f32q is None:
+            return
+
+        # ステレオに変換（左右チャンネルに同じデータをコピー）
+        f32 = np.stack((f32q, f32q), axis=-1)
+        b_i16 = (f32*32767.0).astype(np.int16)
+        buffer = io.BytesIO()
+        buffer.write(b_i16.tobytes())
+        buffer.seek(0)  # 読み込み用にポインタを先頭に戻す
+
+        # BytesIOを直接PCMAudioで再生
+        audio_source = discord.PCMAudio(buffer)
+        vc:discord.VoiceClient = self.ctx.guild.voice_client
+        if not vc.is_playing():
+            vc.play(audio_source, after=lambda e: print("再生終了:", e))
+
+        # 再生中メッセージを送信
+        #await ctx.respond("1秒間の正弦波を再生しています。")
 
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
@@ -165,7 +223,7 @@ class MyBot(discord.Bot):
         session:BotSession|None = self._session_map.get(sid)
         if session is not None:
             return session
-        session = BotSession(ctx)
+        session = BotSession(self,ctx)
         self._session_map[sid] = session
         return session
 
@@ -174,6 +232,7 @@ class MyBot(discord.Bot):
         model = self.vosk_model
         if model is None:
             print(f"vosk load {self.vosk_model_name}")
+            vosk.SetLogLevel(-1)
             model = vosk.Model(model_name=self.vosk_model_name)
             self.vosk_model = model
         return model
@@ -224,8 +283,9 @@ class MyBot(discord.Bot):
         user_data:dict[Ukey,list[NDArray[np.float32]]] = {}
         recog_map:dict[Ukey,UserVosk] = {}
         while True:
+            seg:AudioSeg|None
             for ii in range(3):
-                seg:AudioSeg|None = self.buf.get_nowait() if self.buf is not None else None
+                seg = self.buf.get_nowait() if self.buf is not None else None
                 if seg is not None:
                     break
                 await asyncio.sleep(0.1)
@@ -240,7 +300,7 @@ class MyBot(discord.Bot):
                             await self.abc_mesg( ukey, msg )
                 continue
 
-            ukey=seg.ukey
+            ukey:Ukey=seg.ukey
             data_list = user_data.get(ukey)
             if data_list is None:
                 user_data[ukey] = data_list = []
@@ -260,7 +320,7 @@ class MyBot(discord.Bot):
             else:
                 model = self.load_vosk_model()
                 print(f"vosk create KaldiRecognizer")
-                recog = UserVosk( seg.ctx, model, 16000 )
+                recog = UserVosk( ukey, model, 16000 )
                 recog_map[ukey] = recog
 
             if recog.AcceptWaveform( audio_bytes ):
@@ -323,11 +383,6 @@ class MyBot(discord.Bot):
     async def vosk_finished_callback(self, sink, ctx, *args):
         pass
 
-    async def finished_callback(self,sink, ctx, *args):
-        recorded_users = [f"<@{user_id}>" for user_id, audio in sink.audio_data.items()]
-        files = [discord.File(audio.file, f"{user_id}.{sink.encoding}") for user_id, audio in sink.audio_data.items()]
-        await ctx.respond(f"録音が完了しました！\n録音されたユーザー: {', '.join(recorded_users)}.", files=files)
-
     async def abc_mesg(self, ukey:Ukey, mesg ):
         session:BotSession|None = self._get_session(ukey.sid)
         if session is None:
@@ -335,31 +390,8 @@ class MyBot(discord.Bot):
             return
         uname = await self.uid_to_name(ukey)
         print(f"mesg {ukey.sid.gid} {ukey.uid} {uname} {mesg}")
-        vc:discord.VoiceClient = session.ctx.guild.voice_client
-        if vc is None:
-            await ctx.respond('ボイスチャンネルに未接続')
-            return
-        
 
-        # 正弦波の音声データをBytesIOオブジェクトで生成
-        #sine_wave_buffer = generate_sine_wave_bytes()
-        f32q, model = await self.tts.a_text_to_audio_by_voicevox( f"あのね、{mesg}ってなんだよ", sampling_rate=48000 )
-        if f32q is None:
-            return
-        # ステレオに変換（左右チャンネルに同じデータをコピー）
-        f32 = np.stack((f32q, f32q), axis=-1)
-        b_i16 = (f32*32767.0).astype(np.int16)
-        buffer = io.BytesIO()
-        buffer.write(b_i16.tobytes())
-        buffer.seek(0)  # 読み込み用にポインタを先頭に戻す
-
-        # BytesIOを直接PCMAudioで再生
-        audio_source = discord.PCMAudio(buffer)
-        if not vc.is_playing():
-            vc.play(audio_source, after=lambda e: print("再生終了:", e))
-
-        # 再生中メッセージを送信
-        #await ctx.respond("1秒間の正弦波を再生しています。")
+        await session.abc_mesg( ukey.uid, mesg )
 
 def generate_sine_wave_bytes(duration=1):
     SAMPLE_RATE = 48000

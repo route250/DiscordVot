@@ -4,7 +4,7 @@ from io import BytesIO
 import wave
 import numpy as np
 from numpy.typing import NDArray
-from scipy.signal import resample as scipy_resample
+from scipy.signal import resample as scipy_resample, convolve
 
 # 型エイリアス
 AudioF32 = NDArray[np.float32]
@@ -278,3 +278,40 @@ def add_white_noise(audio_data: AudioF32, level: float = 0.01) -> AudioF32:
     noisy_audio = np.clip(adjusted_audio, -1.0, 1.0)
     
     return noisy_audio
+
+# コンプレッサー関数
+def compressor(audio, threshold=0.2, ratio=2.0, gain=1.0):
+    # 最大音量で正規化
+    max_val = np.max(np.abs(audio))
+    normalized_audio = audio / max_val
+    
+    # 閾値を超える部分にコンプレッションを適用
+    compressed_audio = np.where(
+        np.abs(normalized_audio) > threshold,
+        np.sign(normalized_audio) * (threshold + (np.abs(normalized_audio) - threshold) / ratio),
+        normalized_audio
+    )
+    
+    # ゲイン調整して元の音量に戻す
+    compressed_audio = compressed_audio * max_val * gain
+    return compressed_audio
+
+    # シンプルなリバーブを実装するためのインパルスレスポンス
+# （これは簡易的なもので、もっと複雑なインパルスレスポンスも利用可能）
+def _simple_reverb_impulse(length=2000, decay=0.5):
+    impulse = decay ** np.arange(length)
+    return impulse
+
+def reverb(audio:AudioF32) ->AudioF32:
+    max_val = np.max(np.abs(audio))
+    # リバーブのインパルスレスポンスを生成
+    impulse = _simple_reverb_impulse()
+
+    # 音声にリバーブを加える
+    reverb_audio = convolve(audio, impulse, mode='full')
+    reverb_max = np.max(np.abs(reverb_audio))
+    rate = max_val/reverb_max
+
+    # 正規化
+    reverb_audio = reverb_audio * rate
+    return reverb_audio
