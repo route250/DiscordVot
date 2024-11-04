@@ -1,6 +1,7 @@
 import sys,os,io
+import time
 import asyncio
-from asyncio import Task
+from asyncio import Task, Queue as Aqueue
 from queue import Queue
 from typing import Type, Optional, NamedTuple
 import json
@@ -86,113 +87,61 @@ class BufSink(Sink):
     # def get_user_audio(self, user: snowflake.Snowflake):
     #     return None
 
-class BotSession:
-
-    def __init__(self, bot:Type["MyBot"], ctx:ApplicationContext):
-        self.bot:Type["MyBot"] = bot
-        sid:sessionId|None = sessionId.from_ctx(ctx)
-        if sid is None:
-            raise ValueError("can not get sessionId from context")
-        self.sid:sessionId = sid
-        self.ctx:ApplicationContext = ctx
-
-    def is_voice(self):
-        vc:discord.VoiceClient = self.ctx.guild.voice_client
-        return True if vc is not None else False
-
-    async def get_username(self, uid:int) ->str:
-        guild = self.ctx.guild
-        member = guild.get_member(uid)
-        if member is None:
-            try:
-                member = await guild.fetch_member(uid)
-            except:
-                member = None
-        if member is not None:
-            return member.display_name
-        return f"@{uid}"
-
-    async def abc_mesg(self, uid:int, mesg:str ):
-
-        username = await self.get_username(uid)
-
-        await self.ctx.respond(f"User: {username} {mesg}")
-
-        ans =  f"あのね、{mesg}ってなんだよ"
-        await self.def_mesg( ans )
-    
-    async def def_mesg(self, ans:str ):
-        f32q:NDArray[np.float32]|None = None
-        if self.is_voice():
-            # 正弦波の音声データをBytesIOオブジェクトで生成
-            #sine_wave_buffer = generate_sine_wave_bytes()
-            f32a, model = await self.bot.tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
-            if f32a is not None:
-                f32q = reverb( compressor(f32a) )
-        else:
-            f32q = None
-        
-        await self.ctx.respond( ans )
-
-        if f32q is None:
-            return
-
-        # ステレオに変換（左右チャンネルに同じデータをコピー）
-        f32 = np.stack((f32q, f32q), axis=-1)
-        b_i16 = (f32*32767.0).astype(np.int16)
-        buffer = io.BytesIO()
-        buffer.write(b_i16.tobytes())
-        buffer.seek(0)  # 読み込み用にポインタを先頭に戻す
-
-        # BytesIOを直接PCMAudioで再生
-        audio_source = discord.PCMAudio(buffer)
-        vc:discord.VoiceClient = self.ctx.guild.voice_client
-        if not vc.is_playing():
-            vc.play(audio_source, after=lambda e: print("再生終了:", e))
-
-        # 再生中メッセージを送信
-        #await ctx.respond("1秒間の正弦波を再生しています。")
-
-
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 IGNORE2="{\n  \"text\" : \"\"\n}"
 IGNORE1="{\n  \"partial\" : \"\"\n}"
 IGNORE3="{\"text\": \"\"}"
+VOSK_IGNORE_WARDS = {
+    'えー', 'えええ', 'あっ'
+}
 
 def strip_vosk_text( text:str ) ->str|None:
-    if not text:
-        return None
     text = text.strip() if isinstance(text,str) else ''
-    if not text or len(text)==1:
+    if len(text)==0:
         return None
-    return text.replace(' ','')
+    results = ''
+    for w in text.split():
+        if len(w)>1 and not w in VOSK_IGNORE_WARDS:
+            results += w
+    return results if len(results)>0 else None
 
-class UserVosk:
+class UserRecognizer:
     def __init__(self,ukey:Ukey, model,sr):
         self.ukey:Ukey = ukey
         self.recog = vosk.KaldiRecognizer( model, sr )
         self._drty:bool = False
+        self._last_use:float = time.time()
 
-    def AcceptWaveform(self,data):
+    def AcceptWaveform(self,data) ->bool:
+        self._last_use:float = time.time()
         self._drty = True
         return self.recog.AcceptWaveform(data)
     
-    def FinalResult(self):
-        if self._drty:
-            txt = self.recog.FinalResult()
-            self._drty = False
-            self.recog.Reset()
-            if txt == IGNORE2:
-                return IGNORE3
-            return txt
-        else:
-            return IGNORE3
+    def FinalResult(self) ->str|None:
+        try:
+            if self._drty:
+                self._drty = False
+                self._last_use:float = time.time()
+                dat = json.loads(self.recog.FinalResult())
+                self.recog.Reset()
+                return strip_vosk_text( dat.get('text') )
+        except:
+            pass
+        return None
 
-    def Result(self):
-        return self.recog.Result()
+    def Result(self) ->str|None:
+        try:
+            dat = json.loads(self.recog.Result())
+            return strip_vosk_text( dat.get('text') )
+        except:
+            return None
 
     def PartialResult(self):
-        return self.recog.PartialResult()
+        try:
+            dat = json.loads(self.recog.PartialResult())
+            return strip_vosk_text( dat.get('text') )
+        except:
+            return None
 
 class MyBot(discord.Bot):
     def __init__(self):
@@ -212,7 +161,7 @@ class MyBot(discord.Bot):
         #
         self.tts:TtsEngine = TtsEngine()
 
-    def _get_session(self, ctx:ApplicationContext|sessionId|None) -> BotSession|None:
+    def _get_session(self, ctx:ApplicationContext|sessionId|None) -> Optional["BotSession"]:
         if isinstance(ctx,sessionId):
             return self._session_map.get(ctx)
         if not isinstance(ctx,ApplicationContext):
@@ -266,7 +215,7 @@ class MyBot(discord.Bot):
     async def on_ready(self):
         print(f"on_ready")
         if self.vosk_task is None:
-            self.vosk_task = asyncio.create_task(self.vosk_loop())
+            self.vosk_task = asyncio.create_task(self._th_vosk_loop())
             print(f"vosk started")
     
     async def on_disconnect(self):
@@ -279,9 +228,9 @@ class MyBot(discord.Bot):
                 print(f"vosk stopped")
             self.vosk_task = None
 
-    async def vosk_loop(self):
+    async def _th_vosk_loop(self):
         user_data:dict[Ukey,list[NDArray[np.float32]]] = {}
-        recog_map:dict[Ukey,UserVosk] = {}
+        recog_map:dict[Ukey,UserRecognizer] = {}
         while True:
             seg:AudioSeg|None
             for ii in range(3):
@@ -293,11 +242,10 @@ class MyBot(discord.Bot):
             if seg is None or self.buf is None:
                 for ukey,recog in recog_map.items():
                     txt = recog.FinalResult()
-                    if txt != IGNORE3:
-                        j = json.loads(txt)
-                        msg = strip_vosk_text( j.get('text') )
-                        if msg:
-                            await self.abc_mesg( ukey, msg )
+                    if txt:
+                        await self.abc_mesg( ukey, txt )
+                    else:
+                        await self.ghi(ukey,False)
                 continue
 
             ukey:Ukey=seg.ukey
@@ -316,22 +264,23 @@ class MyBot(discord.Bot):
             audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
 
             if ukey in recog_map:
-                recog:UserVosk = recog_map[ukey]
+                recog:UserRecognizer = recog_map[ukey]
             else:
                 model = self.load_vosk_model()
                 print(f"vosk create KaldiRecognizer")
-                recog = UserVosk( ukey, model, 16000 )
+                recog = UserRecognizer( ukey, model, 16000 )
                 recog_map[ukey] = recog
 
             if recog.AcceptWaveform( audio_bytes ):
                 txt = recog.Result()
-                if txt != IGNORE2:
-                    j = json.loads(txt)
-                    msg = strip_vosk_text( j.get('text') )
-                    if msg:
-                        await self.abc_mesg( ukey, msg )
-            # else:
-            #     txt = recog.PartialResult()
+                if txt:
+                    await self.abc_mesg( ukey, txt )
+                else:
+                    await self.ghi(ukey,False)
+            else:
+                txt = recog.PartialResult()
+                if txt:
+                    self.ghi(ukey,True)
             #     if txt != IGNORE1:
             #         print(f"VOSK partial {txt}")
 
@@ -391,7 +340,99 @@ class MyBot(discord.Bot):
         uname = await self.uid_to_name(ukey)
         print(f"mesg {ukey.sid.gid} {ukey.uid} {uname} {mesg}")
 
-        await session.abc_mesg( ukey.uid, mesg )
+        await session.on_message( ukey.uid, mesg )
+
+    async def ghi(self, ukey:Ukey, st:bool ):
+        session:BotSession|None = self._get_session(ukey.sid)
+        if session is not None:
+            await session.ghi( ukey.uid, st)
+
+class VoiceRes(NamedTuple):
+    mesg:str
+    audio:bytes|None
+
+class BotSession:
+
+    def __init__(self, bot:MyBot, ctx:ApplicationContext):
+        self.bot:MyBot = bot
+        sid:sessionId|None = sessionId.from_ctx(ctx)
+        if sid is None:
+            raise ValueError("can not get sessionId from context")
+        self.sid:sessionId = sid
+        self.ctx:ApplicationContext = ctx
+        self._response_q:Aqueue[VoiceRes] = Aqueue()
+        self_task:Task|None = None
+
+    def is_voice(self):
+        vc:discord.VoiceClient = self.ctx.guild.voice_client
+        return True if vc is not None else False
+
+    async def get_username(self, uid:int) ->str:
+        guild = self.ctx.guild
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except:
+                member = None
+        if member is not None:
+            return member.display_name
+        return f"@{uid}"
+
+    async def on_message(self, uid:int, mesg:str, echo:bool ):
+
+        if echo:
+            username = await self.get_username(uid)
+            await self.ctx.respond(f"User: {username} {mesg}")
+
+        ans =  f"あのね、{mesg}ってなんだよ"
+        await self.add_response_queue( ans )
+
+    async def ghi(self, uid:int, st:bool ):
+        pass
+
+    async def add_response_queue(self, ans:str ):
+        audio_bytes:bytes|None
+        if self.is_voice():
+            # 正弦波の音声データをBytesIOオブジェクトで生成
+            #sine_wave_buffer = generate_sine_wave_bytes()
+            voice_f32, model = await self.bot.tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
+            if voice_f32 is not None:
+                audio_f32 = reverb( compressor(voice_f32) )
+                # ステレオに変換（左右チャンネルに同じデータをコピー）
+                f32 = np.stack((audio_f32, audio_f32), axis=-1)
+                b_i16 = (f32*32767.0).astype(np.int16)
+                audio_bytes = b_i16.tobytes()
+        else:
+            audio_bytes = None
+        
+        buffer = VoiceRes( ans, audio_bytes )
+        await self._response_q.put( buffer )
+        await asyncio.sleep(0.1)
+        if self._task is None:
+            self._task = asyncio.create_task( self._th_talk_task() )
+
+    async def _th_talk_task(self):
+        try:
+            x = self._response_q.get_nowait()
+            if x.audio is None:
+                await self.talk( x.mesg )
+            else:           
+                buffer = io.BytesIO()
+                buffer.write(x.audio)
+                buffer.seek(0)
+                audio_source = discord.PCMAudio(buffer)
+                vc:discord.VoiceClient = self.ctx.guild.voice_client
+                while vc.is_playing():
+                    await asyncio.sleep(0.1)
+                await self.talk( x.mesg )
+                vc.play(audio_source, after=lambda e: print("再生終了:", e))
+            pass
+        finally:
+            self._task = None
+
+    async def talk(self,mesg):
+        await self.ctx.respond( mesg )
 
 def generate_sine_wave_bytes(duration=1):
     SAMPLE_RATE = 48000
