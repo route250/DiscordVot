@@ -19,7 +19,7 @@ import librosa
 sys.path.append(os.getcwd())
 from rec_util import AudioF32, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
-
+from llm import LLM
 
 class sessionId(NamedTuple):
     gid:int # guild id
@@ -340,7 +340,7 @@ class MyBot(discord.Bot):
         uname = await self.uid_to_name(ukey)
         print(f"mesg {ukey.sid.gid} {ukey.uid} {uname} {mesg}")
 
-        await session.on_message( ukey.uid, mesg )
+        await session.on_message( ukey.uid, mesg, True )
 
     async def ghi(self, ukey:Ukey, st:bool ):
         session:BotSession|None = self._get_session(ukey.sid)
@@ -361,7 +361,7 @@ class BotSession:
         self.sid:sessionId = sid
         self.ctx:ApplicationContext = ctx
         self._response_q:Aqueue[VoiceRes] = Aqueue()
-        self_task:Task|None = None
+        self._task:Task|None = None
 
     def is_voice(self):
         vc:discord.VoiceClient = self.ctx.guild.voice_client
@@ -385,8 +385,10 @@ class BotSession:
             username = await self.get_username(uid)
             await self.ctx.respond(f"User: {username} {mesg}")
 
-        ans =  f"あのね、{mesg}ってなんだよ"
-        await self.add_response_queue( ans )
+        global_messages:list[dict] = []
+        llm:LLM = LLM()
+        async for ans in llm.th_get_response_from_openai( global_messages, mesg ):
+            await self.add_response_queue( ans )
 
     async def ghi(self, uid:int, st:bool ):
         pass
