@@ -1,6 +1,7 @@
 import sys,os,io
 import time
 import traceback
+from enum import Enum
 import asyncio
 from asyncio import Task, Queue as Aqueue
 from queue import Queue
@@ -263,7 +264,7 @@ class MyBot(discord.Bot):
             session:BotSession|None = self._get_session2(mesg.channel)
             if session:
                 if uid and content:
-                    await session.on_message( uid, content, False )
+                    await session.on_message( uid, content )
 
         except Exception as ex:
             print(f"ERROR {ex}")
@@ -292,7 +293,7 @@ class MyBot(discord.Bot):
                     embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
-                session.vc = ctx.voice_client
+                session.voice_client = ctx.voice_client
                 await session.start()
                 session.buf = BufSink(session.sid)
                 ctx.voice_client.start_recording(session.buf, self.vosk_finished_callback, ctx)
@@ -317,23 +318,33 @@ class MyBot(discord.Bot):
     async def vosk_finished_callback(self, sink, ctx, *args):
         pass
 
+class VoiceStat(Enum):
+    A=1
+    B=2
+    C=3
+    D=4
+    E=5
+    F=6
+
 class VoiceRes(NamedTuple):
+    uid:int
     mesg:str
     audio:bytes|None
 
 class BotSession:
 
-    def __init__(self, bot:MyBot, ch, vc:discord.VoiceClient|None=None):
+    def __init__(self, bot:MyBot, ch, voice_client:discord.VoiceClient|None=None):
         self.bot:MyBot = bot
         sid:sessionId|None = sessionId.from_channel(ch)
         if sid is None:
             raise ValueError("can not get sessionId from context")
         self.sid:sessionId = sid
         self.ch = ch
-        self.vc:discord.VoiceClient|None = vc
+        self.voice_client:discord.VoiceClient|None = voice_client
         self._response_q:Aqueue[VoiceRes] = Aqueue()
         self._task:Task|None = None
         self.vosk_task:Task|None = None
+        self.stt_stat:dict[int,VoiceStat] = {}
         self.buf:BufSink|None = None
 
     async def start(self):
@@ -351,7 +362,7 @@ class BotSession:
 
     def is_voice(self):
         try:
-            if self.vc is not None and self.vc.is_connected():
+            if self.voice_client is not None and self.voice_client.is_connected():
                 return True
         except:
             pass
@@ -372,10 +383,7 @@ class BotSession:
                 if seg is None or self.buf is None:
                     for uid,recog in recog_map.items():
                         txt = recog.FinalResult()
-                        if txt:
-                            await self.abc_mesg( uid, txt )
-                        else:
-                            await self.ghi(uid,False)
+                        await self.abc_mesg( uid, txt )
                     continue
 
                 uid:int=seg.ukey.uid
@@ -403,22 +411,26 @@ class BotSession:
 
                 if recog.AcceptWaveform( audio_bytes ):
                     txt = recog.Result()
-                    if txt:
-                        await self.abc_mesg( uid, txt )
-                    else:
-                        await self.ghi(uid,False)
+                    await self.abc_mesg( uid, txt )
                 else:
                     txt = recog.PartialResult()
                     if txt:
-                        await self.ghi(uid,True)
+                        await self.update_stat(uid,VoiceStat.A)
                 #     if txt != IGNORE1:
                 #         print(f"VOSK partial {txt}")
         except:
             traceback.print_exc()
         finally:
             self.vosk_task = None
+            self.stt_stat = {}
             # for uid,recog in recog_map.items():
             #     recog.
+    async def update_stat(self, uid:int, stat:VoiceStat|None):
+        if stat is None:
+            del self.stt_stat[uid]
+        else:
+            self.stt_stat[uid] = stat
+        
 
     async def get_username(self, uid:int) ->str:
         guild = self.ch.guild
@@ -432,32 +444,30 @@ class BotSession:
             return member.display_name
         return f"@{uid}"
 
+    async def is_accept(self,mesg):
+        return True
+
     async def abc_mesg(self, uid:int, mesg ):
-        gid = self.ch.guild.id
-        uname = await self.bot.uid_to_name(gid,uid)
-        print(f"mesg {gid} {uid} {uname} {mesg}")
-
-        await self.on_message( uid, mesg, True )
-
-    async def on_message(self, uid:int, mesg:str, echo:bool ):
-
-        if echo:
+        if mesg:
+            gid = self.ch.guild.id
             username = await self.get_username(uid)
-            await self.ch.send(f"User: {username} {mesg}")
+            print(f"mesg {gid} {uid} {username} {mesg}")
+            accept:bool = await self.is_accept(mesg)
+            if accept:
+                await self.ch.send(f"User: {username} {mesg}")
+                await self.on_message(uid, mesg)
+        await self.update_stat(uid,None)
+
+    async def on_message(self, uid:int, mesg:str ):
 
         global_messages:list[dict] = []
         llm:LLM = LLM()
         async for ans in llm.th_get_response_from_openai( global_messages, mesg ):
-            await self.add_response_queue( ans )
+            await self.add_response_queue( uid, ans )
 
-    async def ghi(self, uid:int, st:bool ):
-        pass
-
-    async def add_response_queue(self, ans:str ):
+    async def add_response_queue(self, uid, ans:str ):
         audio_bytes:bytes|None
         if self.is_voice():
-            # 正弦波の音声データをBytesIOオブジェクトで生成
-            #sine_wave_buffer = generate_sine_wave_bytes()
             voice_f32, model = await self.bot.tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
             if voice_f32 is not None:
                 audio_f32 = reverb( compressor(voice_f32) )
@@ -468,7 +478,7 @@ class BotSession:
         else:
             audio_bytes = None
         
-        buffer = VoiceRes( ans, audio_bytes )
+        buffer = VoiceRes( uid, ans, audio_bytes )
         await self._response_q.put( buffer )
         await asyncio.sleep(0.1)
         if self._task is None:
@@ -479,15 +489,15 @@ class BotSession:
             x = self._response_q.get_nowait()
             if x.audio is None:
                 await self.talk( x.mesg )
-            elif self.vc is not None:
+            elif self.voice_client is not None:
                 buffer = io.BytesIO()
                 buffer.write(x.audio)
                 buffer.seek(0)
                 audio_source = discord.PCMAudio(buffer)
-                while self.vc.is_playing():
+                while self.voice_client.is_playing():
                     await asyncio.sleep(0.1)
                 await self.talk( x.mesg )
-                self.vc.play(audio_source, after=lambda e: print("再生終了:", e))
+                self.voice_client.play(audio_source, after=lambda e: print("再生終了:", e))
         finally:
             self._task = None
 
