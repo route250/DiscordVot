@@ -1,5 +1,6 @@
 import sys,os,io
 import time
+import traceback
 import asyncio
 from asyncio import Task, Queue as Aqueue
 from queue import Queue
@@ -8,6 +9,8 @@ import json
 
 from dotenv import load_dotenv
 import discord
+from discord import Message, Member, User
+from discord.channel import TextChannel, VoiceChannel
 from discord.commands.context import ApplicationContext
 from discord.commands import Option
 from discord.sinks import Sink, Filters
@@ -32,6 +35,26 @@ class sessionId(NamedTuple):
             cid = ctx.channel_id
             if gid and cid:
                 return sessionId(gid,cid)
+        return None
+
+    @staticmethod
+    def from_message(message:Message|None) ->Optional["sessionId"]:
+        if isinstance(message,Message):
+            gid = message.guild.id if message.guild else None
+            cid = message.channel.id
+            if gid and cid:
+                return sessionId(gid,cid)
+        return None
+
+    @staticmethod
+    def from_channel(ch) ->Optional["sessionId"]:
+        try:
+            gid = ch.guild.id if ch.guild else None
+            cid = ch.id
+            if gid and cid:
+                return sessionId(gid,cid)
+        except:
+            pass
         return None
 
 class Ukey(NamedTuple):
@@ -106,8 +129,8 @@ def strip_vosk_text( text:str ) ->str|None:
     return results if len(results)>0 else None
 
 class UserRecognizer:
-    def __init__(self,ukey:Ukey, model,sr):
-        self.ukey:Ukey = ukey
+    def __init__(self,uid:int, model,sr):
+        self.ukey:int = uid
         self.recog = vosk.KaldiRecognizer( model, sr )
         self._drty:bool = False
         self._last_use:float = time.time()
@@ -145,13 +168,13 @@ class UserRecognizer:
 
 class MyBot(discord.Bot):
     def __init__(self):
-        super().__init__()
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
         self._add_commands()
         # session
         self._session_map:dict[sessionId,BotSession] = {}
         #
-        self.vosk_task:Task|None = None
-        self.buf:BufSink|None = None
         self.vc:discord.VoiceClient|None = None
         # vosk
         self.vosk_model_name:str = MODEL_NAME_SMALL
@@ -172,7 +195,18 @@ class MyBot(discord.Bot):
         session:BotSession|None = self._session_map.get(sid)
         if session is not None:
             return session
-        session = BotSession(self,ctx)
+        session = BotSession(self, ctx.channel )
+        self._session_map[sid] = session
+        return session
+
+    def _get_session2(self, ch ) -> Optional["BotSession"]:
+        sid:sessionId|None = sessionId.from_channel(ch)
+        if sid is None:
+            return None
+        session:BotSession|None = self._session_map.get(sid)
+        if session is not None:
+            return session
+        session = BotSession(self, ch, None )
         self._session_map[sid] = session
         return session
 
@@ -186,109 +220,58 @@ class MyBot(discord.Bot):
             self.vosk_model = model
         return model
 
-    async def uid_to_name(self,ukey:Ukey) ->str:
-        guild = self.get_guild(ukey.sid.gid)
+    async def uid_to_name(self,gid:int,uid:int) ->str:
+        guild = self.get_guild(gid)
         if guild is None:
             try:
-                guild = await self.fetch_guild(ukey.sid.gid)
+                guild = await self.fetch_guild(gid)
             except:
                 guild = None
         if guild is not None:
-            member = guild.get_member(ukey.uid)
+            member = guild.get_member(uid)
             if member is None:
                 try:
-                    member = await guild.fetch_member(ukey.uid)
+                    member = await guild.fetch_member(uid)
                 except:
                     member = None
             if member is not None:
                 return member.display_name
 
-        user = self.get_user(ukey.uid)
+        user = self.get_user(uid)
         if user is not None:
             return user.name
         try:
-            user = await self.fetch_user(ukey.uid)
+            user = await self.fetch_user(uid)
             return user.name
         except:
-            return f"@{ukey.uid}"
+            return f"@{uid}"
 
     async def on_ready(self):
         print(f"on_ready")
-        if self.vosk_task is None:
-            self.vosk_task = asyncio.create_task(self._th_vosk_loop())
-            print(f"vosk started")
     
     async def on_disconnect(self):
         print(f"on_disconnect")
-        if self.vosk_task is not None:
-            self.vosk_task.cancel()
-            try:
-                await self.vosk_task
-            except asyncio.CancelledError:
-                print(f"vosk stopped")
-            self.vosk_task = None
+        for k,v in self._session_map.items():
+            await v.stop()
 
-    async def _th_vosk_loop(self):
-        user_data:dict[Ukey,list[NDArray[np.float32]]] = {}
-        recog_map:dict[Ukey,UserRecognizer] = {}
-        while True:
-            seg:AudioSeg|None
-            for ii in range(3):
-                seg = self.buf.get_nowait() if self.buf is not None else None
-                if seg is not None:
-                    break
-                await asyncio.sleep(0.1)
-            
-            if seg is None or self.buf is None:
-                for ukey,recog in recog_map.items():
-                    txt = recog.FinalResult()
-                    if txt:
-                        await self.abc_mesg( ukey, txt )
-                    else:
-                        await self.ghi(ukey,False)
-                continue
+    async def on_message(self, mesg:Message ):
+        try:
+            if mesg.author == self.user:
+                return
+            uid = mesg.author.id
+            content = mesg.content
+            session:BotSession|None = self._get_session2(mesg.channel)
+            if session:
+                if uid and content:
+                    await session.on_message( uid, content, False )
 
-            ukey:Ukey=seg.ukey
-            data_list = user_data.get(ukey)
-            if data_list is None:
-                user_data[ukey] = data_list = []
-            data_list.append(seg.data)
-            total = sum( [len(a) for a in data_list])
-            sample_rate = self.buf.sample_rate
-            total_sec = total/sample_rate
-            if total_sec<0.2:
-                continue
-            user_data[ukey] = []
-            orig_f32:NDArray[np.float32] = np.concatenate(data_list)
-            target_f32 = librosa.resample( orig_f32, orig_sr = sample_rate, target_sr=16000)
-            audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
-
-            if ukey in recog_map:
-                recog:UserRecognizer = recog_map[ukey]
-            else:
-                model = self.load_vosk_model()
-                print(f"vosk create KaldiRecognizer")
-                recog = UserRecognizer( ukey, model, 16000 )
-                recog_map[ukey] = recog
-
-            if recog.AcceptWaveform( audio_bytes ):
-                txt = recog.Result()
-                if txt:
-                    await self.abc_mesg( ukey, txt )
-                else:
-                    await self.ghi(ukey,False)
-            else:
-                txt = recog.PartialResult()
-                if txt:
-                    self.ghi(ukey,True)
-            #     if txt != IGNORE1:
-            #         print(f"VOSK partial {txt}")
+        except Exception as ex:
+            print(f"ERROR {ex}")
 
     def _add_commands(self):
         @self.slash_command(description="ボイスチャンネルに参加します。")
         async def join( ctx:ApplicationContext):
             try:
-                print(f"join {type(ctx)}")
                 session:BotSession|None = self._get_session(ctx)
                 if session is None:
                     embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
@@ -309,8 +292,10 @@ class MyBot(discord.Bot):
                     embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
-                self.buf = BufSink(session.sid)
-                ctx.voice_client.start_recording(self.buf, self.vosk_finished_callback, ctx)
+                session.vc = ctx.voice_client
+                await session.start()
+                session.buf = BufSink(session.sid)
+                ctx.voice_client.start_recording(session.buf, self.vosk_finished_callback, ctx)
                 embed = discord.Embed(title="成功",description="ボイスチャンネルに参加しました。",color=discord.Colour.green())
                 await ctx.respond(embed=embed)
             except Exception as ex:
@@ -332,43 +317,111 @@ class MyBot(discord.Bot):
     async def vosk_finished_callback(self, sink, ctx, *args):
         pass
 
-    async def abc_mesg(self, ukey:Ukey, mesg ):
-        session:BotSession|None = self._get_session(ukey.sid)
-        if session is None:
-            print("ERROR can not get session")
-            return
-        uname = await self.uid_to_name(ukey)
-        print(f"mesg {ukey.sid.gid} {ukey.uid} {uname} {mesg}")
-
-        await session.on_message( ukey.uid, mesg, True )
-
-    async def ghi(self, ukey:Ukey, st:bool ):
-        session:BotSession|None = self._get_session(ukey.sid)
-        if session is not None:
-            await session.ghi( ukey.uid, st)
-
 class VoiceRes(NamedTuple):
     mesg:str
     audio:bytes|None
 
 class BotSession:
 
-    def __init__(self, bot:MyBot, ctx:ApplicationContext):
+    def __init__(self, bot:MyBot, ch, vc:discord.VoiceClient|None=None):
         self.bot:MyBot = bot
-        sid:sessionId|None = sessionId.from_ctx(ctx)
+        sid:sessionId|None = sessionId.from_channel(ch)
         if sid is None:
             raise ValueError("can not get sessionId from context")
         self.sid:sessionId = sid
-        self.ctx:ApplicationContext = ctx
+        self.ch = ch
+        self.vc:discord.VoiceClient|None = vc
         self._response_q:Aqueue[VoiceRes] = Aqueue()
         self._task:Task|None = None
+        self.vosk_task:Task|None = None
+        self.buf:BufSink|None = None
+
+    async def start(self):
+        if self.vosk_task is None:
+            self.vosk_task = asyncio.create_task( self._th_vosk_loop() )
+
+    async def stop(self):
+        if self.vosk_task is not None:
+            self.vosk_task.cancel()
+            try:
+                await self.vosk_task
+            except asyncio.CancelledError:
+                print(f"vosk stopped")
+            self.vosk_task = None
 
     def is_voice(self):
-        vc:discord.VoiceClient = self.ctx.guild.voice_client
-        return True if vc is not None else False
+        try:
+            if self.vc is not None and self.vc.is_connected():
+                return True
+        except:
+            pass
+        return False
+
+    async def _th_vosk_loop(self):
+        user_data:dict[int,list[NDArray[np.float32]]] = {}
+        recog_map:dict[int,UserRecognizer] = {}
+        try:
+            while True:
+                seg:AudioSeg|None
+                for ii in range(3):
+                    seg = self.buf.get_nowait() if self.buf is not None else None
+                    if seg is not None:
+                        break
+                    await asyncio.sleep(0.1)
+                
+                if seg is None or self.buf is None:
+                    for uid,recog in recog_map.items():
+                        txt = recog.FinalResult()
+                        if txt:
+                            await self.abc_mesg( uid, txt )
+                        else:
+                            await self.ghi(uid,False)
+                    continue
+
+                uid:int=seg.ukey.uid
+                data_list = user_data.get(uid)
+                if data_list is None:
+                    user_data[uid] = data_list = []
+                data_list.append(seg.data)
+                total = sum( [len(a) for a in data_list])
+                sample_rate = self.buf.sample_rate
+                total_sec = total/sample_rate
+                if total_sec<0.2:
+                    continue
+                user_data[uid] = []
+                orig_f32:NDArray[np.float32] = np.concatenate(data_list)
+                target_f32 = librosa.resample( orig_f32, orig_sr = sample_rate, target_sr=16000)
+                audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
+
+                if uid in recog_map:
+                    recog:UserRecognizer = recog_map[uid]
+                else:
+                    model = self.bot.load_vosk_model()
+                    print(f"vosk create KaldiRecognizer")
+                    recog = UserRecognizer( uid, model, 16000 )
+                    recog_map[uid] = recog
+
+                if recog.AcceptWaveform( audio_bytes ):
+                    txt = recog.Result()
+                    if txt:
+                        await self.abc_mesg( uid, txt )
+                    else:
+                        await self.ghi(uid,False)
+                else:
+                    txt = recog.PartialResult()
+                    if txt:
+                        await self.ghi(uid,True)
+                #     if txt != IGNORE1:
+                #         print(f"VOSK partial {txt}")
+        except:
+            traceback.print_exc()
+        finally:
+            self.vosk_task = None
+            # for uid,recog in recog_map.items():
+            #     recog.
 
     async def get_username(self, uid:int) ->str:
-        guild = self.ctx.guild
+        guild = self.ch.guild
         member = guild.get_member(uid)
         if member is None:
             try:
@@ -379,11 +432,18 @@ class BotSession:
             return member.display_name
         return f"@{uid}"
 
+    async def abc_mesg(self, uid:int, mesg ):
+        gid = self.ch.guild.id
+        uname = await self.bot.uid_to_name(gid,uid)
+        print(f"mesg {gid} {uid} {uname} {mesg}")
+
+        await self.on_message( uid, mesg, True )
+
     async def on_message(self, uid:int, mesg:str, echo:bool ):
 
         if echo:
             username = await self.get_username(uid)
-            await self.ctx.respond(f"User: {username} {mesg}")
+            await self.ch.send(f"User: {username} {mesg}")
 
         global_messages:list[dict] = []
         llm:LLM = LLM()
@@ -419,22 +479,20 @@ class BotSession:
             x = self._response_q.get_nowait()
             if x.audio is None:
                 await self.talk( x.mesg )
-            else:           
+            elif self.vc is not None:
                 buffer = io.BytesIO()
                 buffer.write(x.audio)
                 buffer.seek(0)
                 audio_source = discord.PCMAudio(buffer)
-                vc:discord.VoiceClient = self.ctx.guild.voice_client
-                while vc.is_playing():
+                while self.vc.is_playing():
                     await asyncio.sleep(0.1)
                 await self.talk( x.mesg )
-                vc.play(audio_source, after=lambda e: print("再生終了:", e))
-            pass
+                self.vc.play(audio_source, after=lambda e: print("再生終了:", e))
         finally:
             self._task = None
 
     async def talk(self,mesg):
-        await self.ctx.respond( mesg )
+        await self.ch.send( mesg )
 
 def generate_sine_wave_bytes(duration=1):
     SAMPLE_RATE = 48000
