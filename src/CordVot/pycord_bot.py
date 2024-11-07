@@ -181,7 +181,7 @@ class MyBot(discord.Bot):
         self.vosk_model_name:str = MODEL_NAME_SMALL
         self.vosk_model:vosk.Model|None = None
         self.vosk_map:dict = {}
-        self.load_vosk_model()
+        self._load_task = None
         #
         self.tts:TtsEngine = TtsEngine()
 
@@ -211,7 +211,7 @@ class MyBot(discord.Bot):
         self._session_map[sid] = session
         return session
 
-    def load_vosk_model(self) ->vosk.Model:
+    async def _th_load_vosk_model(self):
         # VOSKモデルの読み込み
         model = self.vosk_model
         if model is None:
@@ -219,7 +219,13 @@ class MyBot(discord.Bot):
             vosk.SetLogLevel(-1)
             model = vosk.Model(model_name=self.vosk_model_name)
             self.vosk_model = model
-        return model
+
+    async def get_vosk_model(self) ->vosk.Model:
+        if self.vosk_model is None and self._load_task is None:
+            self._load_task = asyncio.create_task(self._th_load_vosk_model())
+        while self.vosk_model is None:
+            await asyncio.sleep(0.1)
+        return self.vosk_model
 
     async def uid_to_name(self,gid:int,uid:int) ->str:
         guild = self.get_guild(gid)
@@ -249,6 +255,7 @@ class MyBot(discord.Bot):
 
     async def on_ready(self):
         print(f"on_ready")
+        self._load_task = asyncio.create_task(self._th_load_vosk_model())
     
     async def on_disconnect(self):
         print(f"on_disconnect")
@@ -318,13 +325,36 @@ class MyBot(discord.Bot):
     async def vosk_finished_callback(self, sink, ctx, *args):
         pass
 
-class VoiceStat(Enum):
-    A=1
-    B=2
-    C=3
-    D=4
-    E=5
-    F=6
+class VoiceStat:
+    def __init__(self,uid:int):
+        self.uid:int = uid
+        self._partial:str = ''
+        self._texts:list[str] = []
+        self.audio:list[NDArray[np.float32]] = []
+
+    def partial(self,msg:str):
+        self._partial = msg
+        print(f"[VOICE] partial {msg}")
+
+    def final(self,msg:str):
+        if self._partial or msg.strip():
+            print(f"[VOICE] final {msg}")
+        self._partial=''
+        if not msg:
+            return
+        if msg.strip()=='' and len(self._texts)==0:
+            return
+        self._texts.append(msg)
+    
+    def is_data(self) ->bool:
+        if self._partial or self._texts:
+            return True
+        return False
+
+    def get_data(self) ->str:
+        ret = ' '.join(self._texts).strip()
+        self._texts = []
+        return ret
 
 class VoiceRes(NamedTuple):
     uid:int
@@ -344,6 +374,7 @@ class BotSession:
         self._response_q:Aqueue[VoiceRes] = Aqueue()
         self._task:Task|None = None
         self.vosk_task:Task|None = None
+        self._notify_task:Task|None = None
         self.stt_stat:dict[int,VoiceStat] = {}
         self.buf:BufSink|None = None
         #
@@ -354,6 +385,8 @@ class BotSession:
     async def start(self):
         if self.vosk_task is None:
             self.vosk_task = asyncio.create_task( self._th_vosk_loop() )
+        if self._notify_task is None:
+            self._notify_task = asyncio.create_task( self._th_stt_notify() )
 
     async def stop(self):
         if self.vosk_task is not None:
@@ -373,7 +406,6 @@ class BotSession:
         return False
 
     async def _th_vosk_loop(self):
-        user_data:dict[int,list[NDArray[np.float32]]] = {}
         recog_map:dict[int,UserRecognizer] = {}
         try:
             while True:
@@ -385,43 +417,44 @@ class BotSession:
                     await asyncio.sleep(0.01)
                 
                 if seg is None or self.buf is None:
-                    for uid,recog in recog_map.items():
-                        txt = recog.FinalResult()
-                        await self.stt_mesg( uid, txt )
+                    for uid,stat in self.stt_stat.items():
+                        r = recog_map.get(uid)
+                        txt = r.FinalResult() if r else None
+                        stat.final(txt if txt else ' ')
                     continue
 
                 uid:int=seg.ukey.uid
-                data_list = user_data.get(uid)
-                if data_list is None:
-                    user_data[uid] = data_list = []
-                data_list.append(seg.data)
-                total = sum( [len(a) for a in data_list])
+                stat = self.stt_stat.get(uid)
+                if stat is None:
+                    stat = self.stt_stat[uid] = VoiceStat(uid)
+                stat.audio.append(seg.data)
+                total = sum( [len(a) for a in stat.audio])
                 sample_rate = self.buf.sample_rate
                 total_sec = total/sample_rate
                 if total_sec<0.2:
                     continue
-                user_data[uid] = []
-                orig_f32:NDArray[np.float32] = np.concatenate(data_list)
+                xaudio = stat.audio
+                stat.audio = []
+                orig_f32:NDArray[np.float32] = np.concatenate(xaudio)
                 target_f32 = librosa.resample( orig_f32, orig_sr = sample_rate, target_sr=16000)
                 audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
-
                 if uid in recog_map:
                     recog:UserRecognizer = recog_map[uid]
                 else:
-                    model = self.bot.load_vosk_model()
+                    model = await self.bot.get_vosk_model()
                     print(f"vosk create KaldiRecognizer")
                     recog = UserRecognizer( uid, model, 16000 )
                     recog_map[uid] = recog
 
                 if recog.AcceptWaveform( audio_bytes ):
                     txt = recog.Result()
-                    await self.stt_mesg( uid, txt )
+                    if txt:
+                        stat.final(txt)
                 else:
                     txt = recog.PartialResult()
                     if txt:
-                        await self.update_stat(uid,VoiceStat.A)
-                #     if txt != IGNORE1:
-                #         print(f"VOSK partial {txt}")
+                        stat.partial(txt)
+
         except:
             traceback.print_exc()
         finally:
@@ -429,15 +462,30 @@ class BotSession:
             self.stt_stat = {}
             # for uid,recog in recog_map.items():
             #     recog.
-    async def update_stat(self, uid:int, stat:VoiceStat|None):
-        if stat is None:
-            try:
-                del self.stt_stat[uid]
-            except:
-                pass
-        else:
-            self.stt_stat[uid] = stat
-        
+
+    async def _th_stt_notify(self):
+        try:
+            while True:
+                await asyncio.sleep(0.01)                
+                pause:bool = False
+                for uid,stat in self.stt_stat.items():
+                    if stat.is_data():
+                        pause = True
+                if self._res_task is not None:
+                    self._res_task._pause = pause
+                await asyncio.sleep(0.01)                
+                for uid,stat in self.stt_stat.items():
+                    mesg = stat.get_data()
+                    if mesg:
+                        accept:bool = await self.is_accept(mesg)
+                        if accept:
+                            await self.on_message(uid, mesg,echoback=True,speech=True)
+                            await asyncio.sleep(0.01)                
+                await asyncio.sleep(0.01)                
+        except:
+            traceback.print_exc()
+        finally:
+            self._notify_task = None
 
     async def get_username(self, uid:int) ->str:
         guild = self.ch.guild
@@ -453,13 +501,6 @@ class BotSession:
 
     async def is_accept(self,mesg):
         return True
-
-    async def stt_mesg(self, uid:int, mesg ):
-        if mesg:
-            accept:bool = await self.is_accept(mesg)
-            if accept:
-                await self.on_message(uid, mesg,echoback=True,speech=True)
-        await self.update_stat(uid,None)
 
     async def on_message(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False ):
 
