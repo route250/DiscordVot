@@ -25,9 +25,13 @@ class LLM:
         self.run:bool = True
         self.llm_run:int = 0
         self.transcrib_id:int = 0
+        self._cancel:bool = False
+
+    def cancel(self):
+        self._cancel = True
 
     def _is_llm_abort(self) ->bool:
-        return False
+        return self._cancel
     
     async def th_get_response_from_openai(self, global_messages:list[dict], user_input:str ):
         """

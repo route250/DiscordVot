@@ -346,6 +346,10 @@ class BotSession:
         self.vosk_task:Task|None = None
         self.stt_stat:dict[int,VoiceStat] = {}
         self.buf:BufSink|None = None
+        #
+        self._res_task = None
+        #
+        self._global_messages:list[dict] = []
 
     async def start(self):
         if self.vosk_task is None:
@@ -378,12 +382,12 @@ class BotSession:
                     seg = self.buf.get_nowait() if self.buf is not None else None
                     if seg is not None:
                         break
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.01)
                 
                 if seg is None or self.buf is None:
                     for uid,recog in recog_map.items():
                         txt = recog.FinalResult()
-                        await self.abc_mesg( uid, txt )
+                        await self.stt_mesg( uid, txt )
                     continue
 
                 uid:int=seg.ukey.uid
@@ -411,7 +415,7 @@ class BotSession:
 
                 if recog.AcceptWaveform( audio_bytes ):
                     txt = recog.Result()
-                    await self.abc_mesg( uid, txt )
+                    await self.stt_mesg( uid, txt )
                 else:
                     txt = recog.PartialResult()
                     if txt:
@@ -427,7 +431,10 @@ class BotSession:
             #     recog.
     async def update_stat(self, uid:int, stat:VoiceStat|None):
         if stat is None:
-            del self.stt_stat[uid]
+            try:
+                del self.stt_stat[uid]
+            except:
+                pass
         else:
             self.stt_stat[uid] = stat
         
@@ -447,62 +454,154 @@ class BotSession:
     async def is_accept(self,mesg):
         return True
 
-    async def abc_mesg(self, uid:int, mesg ):
+    async def stt_mesg(self, uid:int, mesg ):
         if mesg:
-            gid = self.ch.guild.id
-            username = await self.get_username(uid)
-            print(f"mesg {gid} {uid} {username} {mesg}")
             accept:bool = await self.is_accept(mesg)
             if accept:
-                await self.ch.send(f"User: {username} {mesg}")
-                await self.on_message(uid, mesg)
+                await self.on_message(uid, mesg,echoback=True,speech=True)
         await self.update_stat(uid,None)
 
-    async def on_message(self, uid:int, mesg:str ):
+    async def on_message(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False ):
 
-        global_messages:list[dict] = []
-        llm:LLM = LLM()
-        async for ans in llm.th_get_response_from_openai( global_messages, mesg ):
-            await self.add_response_queue( uid, ans )
+        while self._res_task is not None:
+            #print(f"[MSG]cancel")
+            await self._res_task.cancel()
+    
+        asyncio.create_task( self.bbbb(uid,user_content,echoback=echoback,speech=speech) )
 
-    async def add_response_queue(self, uid, ans:str ):
-        audio_bytes:bytes|None
-        if self.is_voice():
-            voice_f32, model = await self.bot.tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
-            if voice_f32 is not None:
-                audio_f32 = reverb( compressor(voice_f32) )
-                # ステレオに変換（左右チャンネルに同じデータをコピー）
-                f32 = np.stack((audio_f32, audio_f32), axis=-1)
-                b_i16 = (f32*32767.0).astype(np.int16)
-                audio_bytes = b_i16.tobytes()
-        else:
-            audio_bytes = None
-        
-        buffer = VoiceRes( uid, ans, audio_bytes )
-        await self._response_q.put( buffer )
-        await asyncio.sleep(0.1)
-        if self._task is None:
-            self._task = asyncio.create_task( self._th_talk_task() )
-
-    async def _th_talk_task(self):
+    async def bbbb(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False):
+        print(f"[MSG]start")
         try:
-            x = self._response_q.get_nowait()
-            if x.audio is None:
-                await self.talk( x.mesg )
-            elif self.voice_client is not None:
-                buffer = io.BytesIO()
-                buffer.write(x.audio)
-                buffer.seek(0)
-                audio_source = discord.PCMAudio(buffer)
-                while self.voice_client.is_playing():
-                    await asyncio.sleep(0.1)
-                await self.talk( x.mesg )
-                self.voice_client.play(audio_source, after=lambda e: print("再生終了:", e))
+            if echoback:
+                username = await self.get_username(uid)
+                gid = self.ch.guild.id
+                print(f"mesg {gid} {uid} {username} {user_content}")
+                await self.ch.send(f"🎤 User: {username} {user_content}")
+            dicord_msg:discord.message.Message = await self.ch.send( '......' )
+            tts = self.bot.tts if speech else None
+            vc = self.voice_client if speech else None
+            self._res_task = t = ResponseTask( dicord_msg, self._global_messages, user_content, tts=tts, voice_client=vc )
+            ai_content:str = await t.start()
+            if user_content:
+                self._global_messages.append( {'role':'user', 'content':user_content})
+            if ai_content:
+                self._global_messages.append( {'role':'assistant', 'content':ai_content})
         finally:
-            self._task = None
+            self._res_task = None
+        print(f"[MSG]done")
 
-    async def talk(self,mesg):
-        await self.ch.send( mesg )
+class ResponseTask:
+
+    def __init__(self, msg:discord.message.Message, messages:list[dict], user_content:str, *, tts:TtsEngine|None, voice_client:discord.VoiceClient|None):
+        self.dmsg:discord.message.Message = msg
+        self._message:list[dict] = messages
+        self._user_content = user_content
+        #
+        self._cancel:bool = False
+        self._pause:bool = False
+        #
+        # LLM
+        self._llm:LLM = LLM()
+        self._llm_task = None
+        self._llm_response_list:list[str] = []
+        #
+        self._tts:TtsEngine|None = tts
+        self._tts_task = None
+        self._tts_pos:int = 0
+        self._audio_list:list[discord.PCMAudio|None] = []
+        # play
+        self._voice_client:discord.VoiceClient|None = voice_client
+        self._play_task = None
+        self._play_pos:int = 0
+
+    async def start(self):
+        print(f"[X]start")
+        self._llm_task = asyncio.create_task( self._th_llm() )
+        self._tts_task = asyncio.create_task( self._th_tts() )
+        self._play_task = asyncio.create_task( self._th_talk() )
+        while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
+            await asyncio.sleep(0.1)
+        print(f"[X]done")
+        return self.get_talk_text()
+
+    async def cancel(self):
+        self._llm.cancel()
+        self._cancel = True
+        await asyncio.sleep(0.1)
+        while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
+            await asyncio.sleep(0.1)
+
+    async def _th_llm(self):
+        try:
+            print(f"[LLM]start")
+            async for talk_segment in self._llm.th_get_response_from_openai( self._message, self._user_content ):
+                self._llm_response_list.append(talk_segment)
+                if self._cancel:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            print(f"[LLM]done")
+            self._llm_task = None
+
+    async def _th_tts(self):
+        try:
+            print(f"[TTS]start")
+            while True:
+                while self._tts_pos>=len(self._llm_response_list):
+                    if self._cancel or self._llm_task is None:
+                        break
+                    await asyncio.sleep(0.2)
+                if self._cancel or ( self._tts_pos>=len(self._llm_response_list) and self._llm_task is None ):
+                    break
+                ans = self._llm_response_list[self._tts_pos]
+                self._tts_pos+=1
+                audio_source:discord.PCMAudio|None
+                if self._voice_client is not None and self._tts is not None:
+                    voice_f32, model = await self._tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
+                    if voice_f32 is not None:
+                        audio_f32 = reverb( compressor(voice_f32) )
+                        # ステレオに変換（左右チャンネルに同じデータをコピー）
+                        f32 = np.stack((audio_f32, audio_f32), axis=-1)
+                        b_i16 = (f32*32767.0).astype(np.int16)
+                        audio_bytes = b_i16.tobytes()
+                        buffer = io.BytesIO(audio_bytes)
+                        audio_source = discord.PCMAudio(buffer)
+                else:
+                    audio_source = None
+                self._audio_list.append(audio_source)
+        finally:
+            print(f"[TTS]done")
+            self._tts_task = None
+
+    async def _th_talk(self):
+        try:
+            print(f"[PLAY]start")
+            emoji=""
+            while True:
+                while self._play_pos>=len(self._audio_list) or self._pause or (self._voice_client and self._voice_client.is_playing()):
+                    if self._cancel or self._tts_task is None:
+                        break
+                    await asyncio.sleep(0.2)
+                content_str = self.get_talk_text()
+                if self._cancel or (self._play_pos>=len(self._audio_list) and self._tts_task is None ):
+                    await self.dmsg.edit(content=f"{emoji}{content_str}")
+                    break
+                src = self._audio_list[self._play_pos]
+                self._play_pos+=1
+                if src and self._voice_client:
+                    while self._voice_client.is_playing():
+                        await asyncio.sleep(0.2)
+                    #self._voice_client.play(src, after=lambda e: print("[PLAY]end:", e))
+                    self._voice_client.play(src)
+                    emoji="🔊"
+                await self.dmsg.edit(content=f"{emoji}{content_str} ......")
+        finally:
+            print(f"[PLAY]done")
+            self._play_task = None
+            self._cancel = True
+
+    def get_talk_text(self):
+        return ''.join(self._llm_response_list[:self._play_pos+1])
 
 def generate_sine_wave_bytes(duration=1):
     SAMPLE_RATE = 48000
