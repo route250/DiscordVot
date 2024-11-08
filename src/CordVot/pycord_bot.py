@@ -60,18 +60,13 @@ class sessionId(NamedTuple):
             pass
         return None
 
-class Ukey(NamedTuple):
-    sid:sessionId
-    uid:int
-
 class AudioSeg(NamedTuple):
-    ukey:Ukey
+    uid:int
     data:NDArray[np.float32]
 
 class BufSink(Sink):
-    def __init__(self, sid:sessionId, *, filters=None):
+    def __init__(self, *, filters=None):
         super().__init__( filters=filters)
-        self.sid:sessionId = sid
         self.sample_rate:int = 48000
         self.ch:int = 2
         self.sz:int = 2
@@ -89,14 +84,14 @@ class BufSink(Sink):
             print(f"ERROR: buf init, vc is None")
 
     @Filters.container
-    def write(self, audio_bytes:bytes, user:int):
+    def write(self, audio_bytes:bytes, uid:int):
         try:
             audio_i16:np.ndarray = np.frombuffer( audio_bytes, dtype=np.int16 )
             frames = len(audio_i16)//self.ch
             stereo_i16 = audio_i16.reshape((frames,self.ch))
             mono_i16 = stereo_i16[:,0]
             audio_f32 = mono_i16.astype(np.float32) / 32768.0 * self.vol
-            self.data_q.put(AudioSeg(Ukey(self.sid,user),audio_f32))
+            self.data_q.put(AudioSeg(uid,audio_f32))
         except:
             traceback.print_exc()
 
@@ -139,7 +134,7 @@ def strip_vosk_text( text:str ) ->str|None:
 
 class UserRecognizer:
     def __init__(self,uid:int, model,sr):
-        self.ukey:int = uid
+        self.uid:int = uid
         self.recog = vosk.KaldiRecognizer( model, sr )
         self._drty:bool = False
         self._last_use:float = time.time()
@@ -310,8 +305,8 @@ class MyBot(discord.Bot):
                     return
                 session.voice_client = ctx.voice_client
                 await session.start()
-                session.buf = BufSink(session.sid)
-                ctx.voice_client.start_recording(session.buf, self.vosk_finished_callback, ctx)
+                session.sink = BufSink()
+                ctx.voice_client.start_recording(session.sink, session.sink_finished_callback )
                 embed = discord.Embed(title="成功",description="ボイスチャンネルに参加しました。",color=discord.Colour.green())
                 await ctx.respond(embed=embed)
             except Exception as ex:
@@ -329,9 +324,6 @@ class MyBot(discord.Bot):
                 await ctx.respond(embed=embed)
             except Exception as ex:
                 print(f"ERROR {ex}")
-
-    async def vosk_finished_callback(self, sink, ctx, *args):
-        pass
 
 class VoiceStat:
     def __init__(self,uid:int):
@@ -376,6 +368,18 @@ class VoiceStat:
         self._texts = []
         return ret
 
+def convert_audio(xaudio,original_rate,target_rate) ->bytes:
+    if len(xaudio)==0:
+        return b''
+    if target_rate == original_rate:
+        target_f32 = xaudio
+    else:
+        num_samples = int(len(xaudio) * target_rate / original_rate)
+        target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
+        #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
+    audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
+    return audio_bytes
+
 class VoiceRes(NamedTuple):
     uid:int
     mesg:str
@@ -393,29 +397,29 @@ class BotSession:
         self.voice_client:discord.VoiceClient|None = voice_client
         self._response_q:Aqueue[VoiceRes] = Aqueue()
         self._task:Task|None = None
-        self.vosk_task:Task|None = None
+        self._stt_task:Task|None = None
         self._notify_task:Task|None = None
         self.stt_stat:dict[int,VoiceStat] = {}
-        self.buf:BufSink|None = None
+        self.sink:BufSink|None = None
         #
         self._res_task = None
         #
         self._global_messages:list[dict] = []
 
     async def start(self):
-        if self.vosk_task is None:
-            self.vosk_task = asyncio.create_task( self._th_stt_task() )
+        if self._stt_task is None:
+            self._stt_task = asyncio.create_task( self._th_stt_task() )
         if self._notify_task is None:
-            self._notify_task = asyncio.create_task( self._th_stt_notify() )
+            self._notify_task = asyncio.create_task( self._th_notify_task() )
 
     async def stop(self):
-        if self.vosk_task is not None:
-            self.vosk_task.cancel()
+        if self._stt_task is not None:
+            self._stt_task.cancel()
             try:
-                await self.vosk_task
+                await self._stt_task
             except asyncio.CancelledError:
                 print(f"vosk stopped")
-            self.vosk_task = None
+            self._stt_task = None
 
     def is_voice(self):
         try:
@@ -431,70 +435,67 @@ class BotSession:
         try:
             c:bool = True
             bx:int = 0
-            while self.buf:
+            while self.sink:
                 if self.voice_client is not None and not self.voice_client.is_connected():
                     if c:
                         print(f"voice client is disconnected")
                         c=False
-                original_rate = self.buf.sample_rate
-                seg_list:list[AudioSeg] = self.buf.get_nowait()
-                if len(seg_list)==0:
+                original_rate = self.sink.sample_rate
+                xxx = int(0.2*original_rate)
+                seg_list:list[AudioSeg] = self.sink.get_nowait()
+                if len(seg_list)>0:
+                    bx = 0
+                    for uid,data in seg_list:
+                        stat = self.stt_stat.get(uid)
+                        if stat is None:
+                            stat = self.stt_stat[uid] = VoiceStat(uid)
+                        stat.add_audio(data)
+                        if stat.total<xxx:
+                            continue
+                        audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
+                        if uid in recog_map:
+                            recog:UserRecognizer = recog_map[uid]
+                        else:
+                            model = await self.bot.get_vosk_model()
+                            print(f"vosk create KaldiRecognizer")
+                            recog = UserRecognizer( uid, model, target_rate )
+                            recog_map[uid] = recog
+                        if recog.AcceptWaveform( audio_bytes ):
+                            txt = recog.Result()
+                            stat.final(txt)
+                        else:
+                            txt = recog.PartialResult()
+                            if txt:
+                                stat.partial(txt)
+                    await asyncio.sleep(0.03)
+                else:
                     bx+=1
                     if bx==10:
                         print("$",end="")
                         for uid,stat in self.stt_stat.items():
-                            r = recog_map.get(uid)
-                            txt = r.FinalResult() if r else None
-                            stat.final(txt if txt else ' ')
+                            precog:UserRecognizer|None = recog_map.get(uid)
+                            if stat.total>0:
+                                audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
+                                if precog is None:
+                                    model = await self.bot.get_vosk_model()
+                                    print(f"vosk create KaldiRecognizer")
+                                    precog = UserRecognizer( uid, model, target_rate )
+                                    recog_map[uid] = precog
+                                precog.AcceptWaveform( audio_bytes )
+                            if precog is not None:
+                                txt = precog.FinalResult()
+                                stat.final(txt if txt else ' ')
                     await asyncio.sleep(0.03)
-                    continue
-
-                else:
-                    bx=0
-                    for seg in seg_list:
-                        uid:int=seg.ukey.uid
-                        stat = self.stt_stat.get(uid)
-                        if stat is None:
-                            stat = self.stt_stat[uid] = VoiceStat(uid)
-                        stat.add_audio(seg.data)
-                #
-                for uid,stat in self.stt_stat.items():
-                    total_sec = stat.total/original_rate
-                    if total_sec<0.2:
-                        continue
-                    xaudio = stat.get_audio()
-                    if target_rate == original_rate:
-                        target_f32 = xaudio
-                    else:
-                        num_samples = int(len(xaudio) * target_rate / original_rate)
-                        target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
-                        #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
-                    audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
-                    if uid in recog_map:
-                        recog:UserRecognizer = recog_map[uid]
-                    else:
-                        model = await self.bot.get_vosk_model()
-                        print(f"vosk create KaldiRecognizer")
-                        recog = UserRecognizer( uid, model, target_rate )
-                        recog_map[uid] = recog
-
-                    if recog.AcceptWaveform( audio_bytes ):
-                        txt = recog.Result()
-                        stat.final(txt)
-                    else:
-                        txt = recog.PartialResult()
-                        if txt:
-                            stat.partial(txt)
-
         except:
             traceback.print_exc()
         finally:
-            self.vosk_task = None
+            self._stt_task = None
             self.stt_stat = {}
-            # for uid,recog in recog_map.items():
-            #     recog.
 
-    async def _th_stt_notify(self):
+    async def sink_finished_callback(self, sink, *args):
+        pass
+
+    async def _th_notify_task(self):
         try:
             xpause:bool = False
             while True:
