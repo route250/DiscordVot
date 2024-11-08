@@ -689,6 +689,9 @@ def main():
     if TOKEN is None:
         print("Error: DISCORD_BOT_TOKEN is not set in discord.env")
 
+    import discord.opus
+    if not discord.opus.is_loaded():
+        discord.opus.load_opus('/opt/homebrew/lib/libopus.dylib')
     bot = MyBot()
     bot.run(TOKEN)
 
