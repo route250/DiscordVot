@@ -76,6 +76,7 @@ class BufSink(Sink):
         self.ch:int = 2
         self.sz:int = 2
         self.data_q:Queue[AudioSeg] = Queue()
+        self.vol:float = 2.0
 
     def init(self, vc:discord.VoiceClient):  # called under listen
         super().init(vc)
@@ -94,7 +95,7 @@ class BufSink(Sink):
             frames = len(audio_i16)//self.ch
             stereo_i16 = audio_i16.reshape((frames,self.ch))
             mono_i16 = stereo_i16[:,0]
-            audio_f32 = mono_i16.astype(np.float32) / 32768.0
+            audio_f32 = mono_i16.astype(np.float32) / 32768.0 * self.vol
             self.data_q.put(AudioSeg(Ukey(self.sid,user),audio_f32))
         except:
             traceback.print_exc()
@@ -292,7 +293,7 @@ class MyBot(discord.Bot):
                     embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
-                if ctx.author.voice is None:
+                if not isinstance(ctx.author,Member) or ctx.author.voice is None or ctx.author.voice.channel is None:
                     embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
@@ -462,9 +463,12 @@ class BotSession:
                     if total_sec<0.2:
                         continue
                     xaudio = stat.get_audio()
-                    num_samples = int(len(xaudio) * target_rate / original_rate)
-                    target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
-                    #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
+                    if target_rate == original_rate:
+                        target_f32 = xaudio
+                    else:
+                        num_samples = int(len(xaudio) * target_rate / original_rate)
+                        target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
+                        #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
                     audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
                     if uid in recog_map:
                         recog:UserRecognizer = recog_map[uid]
@@ -679,6 +683,11 @@ class ResponseTask:
                     await asyncio.sleep(0.2)
                 content_str = self.get_talk_text()
                 if self._cancel:
+                    try:
+                        if self._voice_client:
+                            self._voice_client.stop()
+                    except Exception as ex:
+                        print(f"[PLAY]{ex}")
                     await self.dmsg.edit(content=f"{emoji}{content_str}🚫")
                     break
                 if self._cancel or (self._play_pos>=len(self._audio_list) and self._tts_task is None ):
