@@ -86,24 +86,28 @@ class BufSink(Sink):
             print(f"ERROR: buf init, vc is None")
 
     @Filters.container
-    def write(self, data:bytes, user:int):
-        i16:np.ndarray = np.frombuffer( data, dtype=np.int16 )
-        frames = len(i16)//self.ch
-        i2 = i16.reshape((frames,self.ch))
-        i1 = i2[:,0]
-        f32 = i1.astype(np.float32) / 32768.0
-        self.data_q.put(AudioSeg(Ukey(self.sid,user),f32))
+    def write(self, audio_bytes:bytes, user:int):
+        try:
+            audio_i16:np.ndarray = np.frombuffer( audio_bytes, dtype=np.int16 )
+            frames = len(audio_i16)//self.ch
+            stereo_i16 = audio_i16.reshape((frames,self.ch))
+            mono_i16 = stereo_i16[:,0]
+            audio_f32 = mono_i16.astype(np.float32) / 32768.0
+            self.data_q.put(AudioSeg(Ukey(self.sid,user),audio_f32))
+        except:
+            traceback.print_exc()
 
     def cleanup(self):
         super().cleanup()
 
-    def get_nowait(self) ->AudioSeg|None:
+    def get_nowait(self) ->list[AudioSeg]:
+        ret = []
         try:
-            if self.data_q.qsize()>0:
-                return self.data_q.get_nowait()
+            while self.data_q.qsize()>0:
+                ret.append(self.data_q.get_nowait())
         except:
             pass
-        return None
+        return ret
 
     # def get_all_audio(self):
     #     return None
@@ -330,14 +334,26 @@ class VoiceStat:
         self.uid:int = uid
         self._partial:str = ''
         self._texts:list[str] = []
-        self.audio:list[NDArray[np.float32]] = []
+        self._audio:list[NDArray[np.float32]] = []
+        self.total:int = 0
+
+    def add_audio(self,audio:NDArray[np.float32]):
+        self._audio.append(audio)
+        self.total += len(audio)
+
+    def get_audio(self) ->NDArray[np.float32]:
+        a = np.concatenate(self._audio)
+        self._audio = []
+        self.total = 0
+        return a
 
     def partial(self,msg:str):
+        if self._partial or msg:
+            print(f"[VOICE] partial {msg}")
         self._partial = msg
-        print(f"[VOICE] partial {msg}")
 
-    def final(self,msg:str):
-        if self._partial or msg.strip():
+    def final(self,msg:str|None):
+        if self._partial or (msg and msg.strip()):
             print(f"[VOICE] final {msg}")
         self._partial=''
         if not msg:
@@ -346,7 +362,7 @@ class VoiceStat:
             return
         self._texts.append(msg)
     
-    def is_data(self) ->bool:
+    def have_data(self) ->bool:
         if self._partial or self._texts:
             return True
         return False
@@ -408,52 +424,52 @@ class BotSession:
     async def _th_vosk_loop(self):
         recog_map:dict[int,UserRecognizer] = {}
         try:
-            while True:
-                seg:AudioSeg|None
-                for ii in range(3):
-                    seg = self.buf.get_nowait() if self.buf is not None else None
-                    if seg is not None:
-                        break
-                    await asyncio.sleep(0.01)
-                
-                if seg is None or self.buf is None:
-                    for uid,stat in self.stt_stat.items():
-                        r = recog_map.get(uid)
-                        txt = r.FinalResult() if r else None
-                        stat.final(txt if txt else ' ')
-                    continue
-
-                uid:int=seg.ukey.uid
-                stat = self.stt_stat.get(uid)
-                if stat is None:
-                    stat = self.stt_stat[uid] = VoiceStat(uid)
-                stat.audio.append(seg.data)
-                total = sum( [len(a) for a in stat.audio])
+            bx:int = 0
+            while self.buf:
                 sample_rate = self.buf.sample_rate
-                total_sec = total/sample_rate
-                if total_sec<0.2:
+                seg_list:list[AudioSeg] = self.buf.get_nowait()
+                if len(seg_list)==0:
+                    bx+=1
+                    if bx>=10:
+                        bx=0
+                        for uid,stat in self.stt_stat.items():
+                            r = recog_map.get(uid)
+                            txt = r.FinalResult() if r else None
+                            stat.final(txt if txt else ' ')
+                    await asyncio.sleep(0.02)
                     continue
-                xaudio = stat.audio
-                stat.audio = []
-                orig_f32:NDArray[np.float32] = np.concatenate(xaudio)
-                target_f32 = librosa.resample( orig_f32, orig_sr = sample_rate, target_sr=16000)
-                audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
-                if uid in recog_map:
-                    recog:UserRecognizer = recog_map[uid]
-                else:
-                    model = await self.bot.get_vosk_model()
-                    print(f"vosk create KaldiRecognizer")
-                    recog = UserRecognizer( uid, model, 16000 )
-                    recog_map[uid] = recog
 
-                if recog.AcceptWaveform( audio_bytes ):
-                    txt = recog.Result()
-                    if txt:
-                        stat.final(txt)
                 else:
-                    txt = recog.PartialResult()
-                    if txt:
-                        stat.partial(txt)
+                    bx=0
+                    for seg in seg_list:
+                        uid:int=seg.ukey.uid
+                        stat = self.stt_stat.get(uid)
+                        if stat is None:
+                            stat = self.stt_stat[uid] = VoiceStat(uid)
+                        stat.add_audio(seg.data)
+                #
+                for uid,stat in self.stt_stat.items():
+                    total_sec = stat.total/sample_rate
+                    if total_sec<0.2:
+                        continue
+                    xaudio = stat.get_audio()
+                    target_f32 = librosa.resample( xaudio, orig_sr = sample_rate, target_sr=16000)
+                    audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
+                    if uid in recog_map:
+                        recog:UserRecognizer = recog_map[uid]
+                    else:
+                        model = await self.bot.get_vosk_model()
+                        print(f"vosk create KaldiRecognizer")
+                        recog = UserRecognizer( uid, model, 16000 )
+                        recog_map[uid] = recog
+
+                    if recog.AcceptWaveform( audio_bytes ):
+                        txt = recog.Result()
+                        stat.final(txt)
+                    else:
+                        txt = recog.PartialResult()
+                        if txt:
+                            stat.partial(txt)
 
         except:
             traceback.print_exc()
@@ -466,11 +482,13 @@ class BotSession:
     async def _th_stt_notify(self):
         try:
             while True:
-                await asyncio.sleep(0.01)                
+                await asyncio.sleep(0.01)   
+                # 音声認識に結果があるか？             
                 pause:bool = False
                 for uid,stat in self.stt_stat.items():
-                    if stat.is_data():
+                    if stat.have_data():
                         pause = True
+                # 結果があれば一時停止をかける
                 if self._res_task is not None:
                     self._res_task._pause = pause
                 await asyncio.sleep(0.01)                
@@ -479,7 +497,10 @@ class BotSession:
                     if mesg:
                         accept:bool = await self.is_accept(mesg)
                         if accept:
-                            await self.on_message(uid, mesg,echoback=True,speech=True)
+                            # 実行中ならキャンセルする
+                            if self._res_task is not None:
+                                await self._res_task.cancel()
+                            await self.bbbb(uid, mesg,echoback=True,speech=True)
                             await asyncio.sleep(0.01)                
                 await asyncio.sleep(0.01)                
         except:
@@ -625,7 +646,7 @@ class ResponseTask:
                     await asyncio.sleep(0.2)
                 content_str = self.get_talk_text()
                 if self._cancel or (self._play_pos>=len(self._audio_list) and self._tts_task is None ):
-                    await self.dmsg.edit(content=f"{emoji}{content_str}")
+                    await self.dmsg.edit(content=f"{emoji}{content_str}↩️")
                     break
                 src = self._audio_list[self._play_pos]
                 self._play_pos+=1
