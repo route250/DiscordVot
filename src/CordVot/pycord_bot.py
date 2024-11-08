@@ -9,6 +9,7 @@ from typing import Type, Optional, NamedTuple
 import json
 
 from dotenv import load_dotenv
+import discord.opus
 import discord
 from discord import Message, Member, User
 from discord.channel import TextChannel, VoiceChannel
@@ -19,6 +20,7 @@ import numpy as np
 from numpy.typing import NDArray
 import vosk
 import librosa
+from scipy.signal import resample as scipy_resample
 
 sys.path.append(os.getcwd())
 from rec_util import AudioF32, load_wave, reverb, compressor
@@ -116,6 +118,7 @@ class BufSink(Sink):
     #     return None
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
+MODEL_NAME_LARGE = "vosk-model-ja-0.22"
 IGNORE2="{\n  \"text\" : \"\"\n}"
 IGNORE1="{\n  \"partial\" : \"\"\n}"
 IGNORE3="{\"text\": \"\"}"
@@ -182,7 +185,7 @@ class MyBot(discord.Bot):
         #
         self.vc:discord.VoiceClient|None = None
         # vosk
-        self.vosk_model_name:str = MODEL_NAME_SMALL
+        self.vosk_model_name:str = MODEL_NAME_LARGE
         self.vosk_model:vosk.Model|None = None
         self.vosk_map:dict = {}
         self._load_task = None
@@ -363,7 +366,7 @@ class VoiceStat:
         self._texts.append(msg)
     
     def have_data(self) ->bool:
-        if self._partial or self._texts:
+        if self._partial or len(self._texts)>0:
             return True
         return False
 
@@ -400,7 +403,7 @@ class BotSession:
 
     async def start(self):
         if self.vosk_task is None:
-            self.vosk_task = asyncio.create_task( self._th_vosk_loop() )
+            self.vosk_task = asyncio.create_task( self._th_stt_task() )
         if self._notify_task is None:
             self._notify_task = asyncio.create_task( self._th_stt_notify() )
 
@@ -421,22 +424,28 @@ class BotSession:
             pass
         return False
 
-    async def _th_vosk_loop(self):
+    async def _th_stt_task(self):
+        target_rate = 48000
         recog_map:dict[int,UserRecognizer] = {}
         try:
+            c:bool = True
             bx:int = 0
             while self.buf:
-                sample_rate = self.buf.sample_rate
+                if self.voice_client is not None and not self.voice_client.is_connected():
+                    if c:
+                        print(f"voice client is disconnected")
+                        c=False
+                original_rate = self.buf.sample_rate
                 seg_list:list[AudioSeg] = self.buf.get_nowait()
                 if len(seg_list)==0:
                     bx+=1
-                    if bx>=10:
-                        bx=0
+                    if bx==10:
+                        print("$",end="")
                         for uid,stat in self.stt_stat.items():
                             r = recog_map.get(uid)
                             txt = r.FinalResult() if r else None
                             stat.final(txt if txt else ' ')
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.03)
                     continue
 
                 else:
@@ -449,18 +458,20 @@ class BotSession:
                         stat.add_audio(seg.data)
                 #
                 for uid,stat in self.stt_stat.items():
-                    total_sec = stat.total/sample_rate
+                    total_sec = stat.total/original_rate
                     if total_sec<0.2:
                         continue
                     xaudio = stat.get_audio()
-                    target_f32 = librosa.resample( xaudio, orig_sr = sample_rate, target_sr=16000)
+                    num_samples = int(len(xaudio) * target_rate / original_rate)
+                    target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
+                    #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
                     audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
                     if uid in recog_map:
                         recog:UserRecognizer = recog_map[uid]
                     else:
                         model = await self.bot.get_vosk_model()
                         print(f"vosk create KaldiRecognizer")
-                        recog = UserRecognizer( uid, model, 16000 )
+                        recog = UserRecognizer( uid, model, target_rate )
                         recog_map[uid] = recog
 
                     if recog.AcceptWaveform( audio_bytes ):
@@ -481,28 +492,35 @@ class BotSession:
 
     async def _th_stt_notify(self):
         try:
+            xpause:bool = False
             while True:
-                await asyncio.sleep(0.01)   
+                await asyncio.sleep(0.01)
                 # 音声認識に結果があるか？             
                 pause:bool = False
                 for uid,stat in self.stt_stat.items():
                     if stat.have_data():
                         pause = True
+                if xpause != pause:
+                    print(f"[notify]pause:{pause}")
+                    xpause = pause
                 # 結果があれば一時停止をかける
                 if self._res_task is not None:
-                    self._res_task._pause = pause
+                    self._res_task.pause(pause)
                 await asyncio.sleep(0.01)                
+                umsg = {}
                 for uid,stat in self.stt_stat.items():
                     mesg = stat.get_data()
                     if mesg:
+                        print(f"[notify]uid:{uid} msg:{mesg}")
                         accept:bool = await self.is_accept(mesg)
                         if accept:
-                            # 実行中ならキャンセルする
-                            if self._res_task is not None:
-                                await self._res_task.cancel()
-                            await self.bbbb(uid, mesg,echoback=True,speech=True)
-                            await asyncio.sleep(0.01)                
-                await asyncio.sleep(0.01)                
+                            umsg[uid] = mesg
+                if len(umsg)>0:
+                    # 実行中ならキャンセルする
+                    if self._res_task is not None:
+                        await self._res_task.cancel()
+                    asyncio.create_task( self._th_response_task(umsg,echoback=True,speech=True) )
+                    await asyncio.sleep(0.1)                
         except:
             traceback.print_exc()
         finally:
@@ -529,16 +547,20 @@ class BotSession:
             #print(f"[MSG]cancel")
             await self._res_task.cancel()
     
-        asyncio.create_task( self.bbbb(uid,user_content,echoback=echoback,speech=speech) )
+        asyncio.create_task( self._th_response_task( {uid:user_content},echoback=echoback,speech=speech) )
+        await asyncio.sleep(0.1)
 
-    async def bbbb(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False):
+    async def _th_response_task(self, umsg:dict[int,str], echoback:bool=False, speech:bool=False):
         print(f"[MSG]start")
         try:
             if echoback:
-                username = await self.get_username(uid)
-                gid = self.ch.guild.id
-                print(f"mesg {gid} {uid} {username} {user_content}")
-                await self.ch.send(f"🎤 User: {username} {user_content}")
+                for uid,user_content in umsg.items():
+                    username = await self.get_username(uid)
+                    gid = self.ch.guild.id
+                    print(f"mesg {gid} {uid} {username} {user_content}")
+                    await self.ch.send(f"🎤 User: {username} {user_content}")
+            for uid,user_content in umsg.items():
+                pass
             dicord_msg:discord.message.Message = await self.ch.send( '......' )
             tts = self.bot.tts if speech else None
             vc = self.voice_client if speech else None
@@ -577,22 +599,33 @@ class ResponseTask:
         self._play_pos:int = 0
 
     async def start(self):
-        print(f"[X]start")
-        self._llm_task = asyncio.create_task( self._th_llm() )
-        self._tts_task = asyncio.create_task( self._th_tts() )
-        self._play_task = asyncio.create_task( self._th_talk() )
-        while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
-            await asyncio.sleep(0.1)
-        print(f"[X]done")
+        print(f"[ResTask]start")
+        try:
+            self._llm_task = asyncio.create_task( self._th_llm() )
+            self._tts_task = asyncio.create_task( self._th_tts() )
+            self._play_task = asyncio.create_task( self._th_talk() )
+            while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
+                await asyncio.sleep(0.1)
+        except:
+            traceback.print_exc()
+        print(f"[ResTask]done")
         return self.get_talk_text()
 
-    async def cancel(self):
-        self._llm.cancel()
-        self._cancel = True
-        await asyncio.sleep(0.1)
-        while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
-            await asyncio.sleep(0.1)
+    def pause(self,b:bool):
+        if self._pause != b:
+            print(f"[ResTask]pause:{b}")
+        self._pause = b
 
+    async def cancel(self):
+        print("===try to cancel===")
+        try:
+            self._llm.cancel()
+            self._cancel = True
+            await asyncio.sleep(0.1)
+            while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
+                await asyncio.sleep(0.1)
+        finally:
+            print("===finally cancel===")
     async def _th_llm(self):
         try:
             print(f"[LLM]start")
@@ -645,6 +678,9 @@ class ResponseTask:
                         break
                     await asyncio.sleep(0.2)
                 content_str = self.get_talk_text()
+                if self._cancel:
+                    await self.dmsg.edit(content=f"{emoji}{content_str}🚫")
+                    break
                 if self._cancel or (self._play_pos>=len(self._audio_list) and self._tts_task is None ):
                     await self.dmsg.edit(content=f"{emoji}{content_str}↩️")
                     break
@@ -654,7 +690,10 @@ class ResponseTask:
                     while self._voice_client.is_playing():
                         await asyncio.sleep(0.2)
                     #self._voice_client.play(src, after=lambda e: print("[PLAY]end:", e))
-                    self._voice_client.play(src)
+                    try:
+                        self._voice_client.play(src)
+                    except Exception as ex:
+                        print(f"[PLAY]{ex}")
                     emoji="🔊"
                 await self.dmsg.edit(content=f"{emoji}{content_str} ......")
         finally:
@@ -689,9 +728,15 @@ def main():
     if TOKEN is None:
         print("Error: DISCORD_BOT_TOKEN is not set in discord.env")
 
-    import discord.opus
+    # MacOSの場合はbrew install opusが必要
     if not discord.opus.is_loaded():
-        discord.opus.load_opus('/opt/homebrew/lib/libopus.dylib')
+        libopus_path = ['/opt/homebrew/lib/libopus.dylib']
+        for l in libopus_path:
+            if os.path.exists(l):
+                try:
+                    discord.opus.load_opus(l)
+                except:
+                    pass
     bot = MyBot()
     bot.run(TOKEN)
 
