@@ -25,7 +25,7 @@ from scipy.signal import resample as scipy_resample
 sys.path.append(os.getcwd())
 from rec_util import AudioF32, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
-from llm import LLM
+from llm import LLM,LLM2
 
 class sessionId(NamedTuple):
     gid:int # guild id
@@ -144,18 +144,6 @@ class UserRecognizer:
         self._drty = True
         return self.recog.AcceptWaveform(data)
     
-    def FinalResult(self) ->str|None:
-        try:
-            if self._drty:
-                self._drty = False
-                self._last_use:float = time.time()
-                dat = json.loads(self.recog.FinalResult())
-                self.recog.Reset()
-                return strip_vosk_text( dat.get('text') )
-        except:
-            pass
-        return None
-
     def Result(self) ->str|None:
         try:
             dat = json.loads(self.recog.Result())
@@ -169,6 +157,23 @@ class UserRecognizer:
             return strip_vosk_text( dat.get('text') )
         except:
             return None
+
+    def FinalResult(self) ->str|None:
+        try:
+            if self._drty:
+                self._drty = False
+                self._last_use:float = time.time()
+                dat = json.loads(self.recog.FinalResult())
+                return strip_vosk_text( dat.get('text') )
+        except:
+            pass
+        finally:
+            self.recog.Reset()
+        return None
+
+    def Reset(self):
+        self._drty = False
+        self.recog.Reset()
 
 class MyBot(discord.Bot):
     def __init__(self):
@@ -364,9 +369,11 @@ class VoiceStat:
         return False
 
     def get_data(self) ->str:
-        ret = ' '.join(self._texts).strip()
-        self._texts = []
-        return ret
+        if len(self._texts)>0: # and self._texts[-1]==' ':
+            ret = ' '.join(self._texts).strip()
+            self._texts = []
+            return ret
+        return ''
 
 def convert_audio(xaudio,original_rate,target_rate) ->bytes:
     if len(xaudio)==0:
@@ -517,9 +524,9 @@ class BotSession:
                     mesg = stat.get_data()
                     if mesg:
                         print(f"[notify]uid:{uid} msg:{mesg}")
-                        accept:bool = await self.is_accept(mesg)
+                        accept, msg2 = await self.is_accept(mesg)
                         if accept:
-                            umsg[uid] = mesg
+                            umsg[uid] = msg2
                 if len(umsg)>0:
                     # 実行中ならキャンセルする
                     if self._res_task is not None:
@@ -543,8 +550,13 @@ class BotSession:
             return member.display_name
         return f"@{uid}"
 
-    async def is_accept(self,mesg):
-        return True
+    async def is_accept(self,mesg) ->tuple[bool,str]:
+        llm = LLM2()
+        a,b,txt = await llm.th_get_response_from_openai(mesg)
+        stop= a<0
+        if txt and len(txt)>0 and txt!=mesg:
+            mesg = f"{mesg} (推測:{txt})"
+        return stop, mesg
 
     async def on_message(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False ):
 
