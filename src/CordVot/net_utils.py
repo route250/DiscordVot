@@ -19,7 +19,7 @@ async def a_find_first_responsive_host(hostname_list: List[str], port: Optional[
                     response = await client.get(url)
                     if response.status_code in {200, 404}:
                         return url
-                except (httpx.ConnectError, httpx.ReadTimeout):
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
                     continue
 
     return None

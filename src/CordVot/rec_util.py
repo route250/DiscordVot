@@ -280,7 +280,7 @@ def add_white_noise(audio_data: AudioF32, level: float = 0.01) -> AudioF32:
     return noisy_audio
 
 # コンプレッサー関数
-def compressor(audio, threshold=0.2, ratio=2.0, gain=1.0):
+def compressor(audio:AudioF32, threshold=0.2, ratio=2.0, gain=1.0) ->AudioF32:
     # 最大音量で正規化
     max_val = np.max(np.abs(audio))
     normalized_audio = audio / max_val

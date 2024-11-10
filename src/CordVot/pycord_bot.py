@@ -1,6 +1,8 @@
 import sys,os,io
 import time
 import traceback
+from io import BytesIO
+import wave
 from enum import Enum
 import asyncio
 from asyncio import Task, Queue as Aqueue
@@ -23,7 +25,7 @@ import librosa
 from scipy.signal import resample as scipy_resample
 
 sys.path.append(os.getcwd())
-from rec_util import AudioF32, load_wave, reverb, compressor
+from rec_util import AudioF32, EmptyF32, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
 from llm import LLM,LLM2
 
@@ -62,38 +64,70 @@ class sessionId(NamedTuple):
 
 class AudioSeg(NamedTuple):
     uid:int
+    rcvt:float
     data:NDArray[np.float32]
 
 class BufSink(Sink):
     def __init__(self, *, filters=None):
         super().__init__( filters=filters)
-        self.sample_rate:int = 48000
+        self.sampling_rate:int = 48000
         self.ch:int = 2
-        self.sz:int = 2
+        self.width:int = 2
         self.data_q:Queue[AudioSeg] = Queue()
-        self.vol:float = 2.0
+        self.vol:float = 1.0
+        self._audio_buf:list[AudioF32] = []
+        self._zero_count:int = 0
+        self._audo_active:bool = True
+        self._save_idx:int=1
+        self._savebuf:BytesIO = BytesIO()
 
     def init(self, vc:discord.VoiceClient):  # called under listen
         super().init(vc)
         if vc.decoder:
-            self.sample_rate = vc.decoder.SAMPLING_RATE
+            self.sampling_rate = vc.decoder.SAMPLING_RATE
             self.ch = vc.decoder.CHANNELS
-            self.sz = vc.decoder.SAMPLE_SIZE // vc.decoder.CHANNELS
-            print(f"buf {self.sample_rate} {self.ch} {self.sz}")
+            self.width = vc.decoder.SAMPLE_SIZE // vc.decoder.CHANNELS
+            print(f"buf {self.sampling_rate} {self.ch} {self.width}")
         else:
             print(f"ERROR: buf init, vc is None")
 
     @Filters.container
     def write(self, audio_bytes:bytes, uid:int):
         try:
+            # 音声データを変換
             audio_i16:np.ndarray = np.frombuffer( audio_bytes, dtype=np.int16 )
-            frames = len(audio_i16)//self.ch
-            stereo_i16 = audio_i16.reshape((frames,self.ch))
+            stereo_i16 = audio_i16.reshape(-1,self.ch).copy()
             mono_i16 = stereo_i16[:,0]
-            audio_f32 = mono_i16.astype(np.float32) / 32768.0 * self.vol
-            self.data_q.put(AudioSeg(uid,audio_f32))
+            audio_f32 = mono_i16.astype(np.float32) / 32768.0
+            # 無音検知用
+            self._audio_buf.append(audio_f32)
+            if len(self._audio_buf)>20:
+                self._audio_buf.pop(0)
+            if max(audio_f32)<0.05:
+                self._zero_count+=1
+            else:
+                self._zero_count = 0
+            # 無音検知処理
+            if self._audo_active:
+                if self._zero_count>=500:
+                    print("[SINK]down")
+                    self._audo_active = False
+            else:
+                if self._zero_count == 0:
+                    self._audo_active = True
+                    print("[SINK]up")
+                    for a in self._audio_buf:
+                        self._putdata(uid,a)
+            # キューに保存
+            if self._audo_active:
+                self._putdata(uid,audio_f32)
         except:
             traceback.print_exc()
+
+    def _putdata(self, uid, audio_f32:AudioF32 ):
+        self.data_q.put(AudioSeg(uid,time.time(),audio_f32))
+        mono_i16 = (audio_f32 * 32767).astype(np.int16)
+        self._savebuf.write( mono_i16.tobytes() )
 
     def cleanup(self):
         super().cleanup()
@@ -101,6 +135,10 @@ class BufSink(Sink):
     def get_nowait(self) ->list[AudioSeg]:
         ret = []
         try:
+            if self._savebuf.tell()>self.sampling_rate*30:
+                wave_path = f"tmp/audio{self._save_idx:04d}.wav"
+                self._save_idx += 1
+                self.saveto(wave_path)
             while self.data_q.qsize()>0:
                 ret.append(self.data_q.get_nowait())
         except:
@@ -112,6 +150,16 @@ class BufSink(Sink):
 
     # def get_user_audio(self, user: snowflake.Snowflake):
     #     return None
+    def saveto(self,filename):
+        b = self._savebuf.getvalue()
+        self._savebuf.seek(0)
+        print(f"[SINK]save {filename}")
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(self.width)
+            wf.setframerate(self.sampling_rate)
+            wf.writeframes(b)
+
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 MODEL_NAME_LARGE = "vosk-model-ja-0.22"
@@ -138,10 +186,16 @@ class UserRecognizer:
         self.recog = vosk.KaldiRecognizer( model, sr )
         self._drty:bool = False
         self._last_use:float = time.time()
+        self._pre:int = 4000
 
     def AcceptWaveform(self,data) ->bool:
         self._last_use:float = time.time()
-        self._drty = True
+        if not self._drty:
+            self._drty = True
+            if len(data)>self._pre:
+                data = data[:self._pre] + data
+            else:
+                data = b'\0'*self._pre + data + data
         return self.recog.AcceptWaveform(data)
     
     def Result(self) ->str|None:
@@ -336,10 +390,12 @@ class VoiceStat:
         self._partial:str = ''
         self._texts:list[str] = []
         self._audio:list[NDArray[np.float32]] = []
+        self._rcvt:float = 0
         self.total:int = 0
 
-    def add_audio(self,audio:NDArray[np.float32]):
+    def add_audio(self,rcvt:float,audio:NDArray[np.float32]):
         self._audio.append(audio)
+        self._rcvt = rcvt
         self.total += len(audio)
 
     def get_audio(self) ->NDArray[np.float32]:
@@ -382,7 +438,7 @@ def convert_audio(xaudio,original_rate,target_rate) ->bytes:
         target_f32 = xaudio
     else:
         num_samples = int(len(xaudio) * target_rate / original_rate)
-        target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples)
+        target_f32:NDArray[np.float32] = scipy_resample( xaudio, num_samples) # type: ignore
         #target_f32 = librosa.resample( xaudio, orig_sr = original_rate, target_sr=target_rate)
     audio_bytes = (target_f32*32767).astype(np.int16).tobytes()
     return audio_bytes
@@ -440,24 +496,25 @@ class BotSession:
         target_rate = 48000
         recog_map:dict[int,UserRecognizer] = {}
         try:
-            c:bool = True
-            bx:int = 0
+            is_connected:bool = True
+            idx:int = 0
+            cut_time:float = 0.8
             while self.sink:
                 if self.voice_client is not None and not self.voice_client.is_connected():
-                    if c:
+                    if is_connected:
                         print(f"voice client is disconnected")
-                        c=False
-                original_rate = self.sink.sample_rate
-                xxx = int(0.2*original_rate)
+                        is_connected=False
+                original_rate:int = self.sink.sampling_rate
+                segment_sz:int = int(original_rate*0.8) # int(0.2*original_rate)
                 seg_list:list[AudioSeg] = self.sink.get_nowait()
                 if len(seg_list)>0:
-                    bx = 0
-                    for uid,data in seg_list:
+                    idx = 0
+                    for uid,rcvt,data in seg_list:
                         stat = self.stt_stat.get(uid)
                         if stat is None:
                             stat = self.stt_stat[uid] = VoiceStat(uid)
-                        stat.add_audio(data)
-                        if stat.total<xxx:
+                        stat.add_audio(rcvt,data)
+                        if stat.total<segment_sz:
                             continue
                         audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
                         if uid in recog_map:
@@ -467,6 +524,7 @@ class BotSession:
                             print(f"vosk create KaldiRecognizer")
                             recog = UserRecognizer( uid, model, target_rate )
                             recog_map[uid] = recog
+                        print(" *",end="")
                         if recog.AcceptWaveform( audio_bytes ):
                             txt = recog.Result()
                             stat.final(txt)
@@ -476,22 +534,28 @@ class BotSession:
                                 stat.partial(txt)
                     await asyncio.sleep(0.03)
                 else:
-                    bx+=1
-                    if bx==10:
-                        print("$",end="")
-                        for uid,stat in self.stt_stat.items():
-                            precog:UserRecognizer|None = recog_map.get(uid)
-                            if stat.total>0:
-                                audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
-                                if precog is None:
-                                    model = await self.bot.get_vosk_model()
-                                    print(f"vosk create KaldiRecognizer")
-                                    precog = UserRecognizer( uid, model, target_rate )
-                                    recog_map[uid] = precog
-                                precog.AcceptWaveform( audio_bytes )
-                            if precog is not None:
-                                txt = precog.FinalResult()
-                                stat.final(txt if txt else ' ')
+                    idx+=1
+                    now = time.time()
+                    for uid,stat in self.stt_stat.items():
+                        t = now - stat._rcvt
+                        precog:UserRecognizer|None = recog_map.get(uid)
+                        if stat.total == 0 and (precog is None or not precog._drty):
+                            continue
+                        if t<=cut_time:
+                            continue
+                        if stat.total>0:
+                            print(f"|{t}|",end="")
+                            audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
+                            if precog is None:
+                                model = await self.bot.get_vosk_model()
+                                print(f"vosk create KaldiRecognizer")
+                                precog = UserRecognizer( uid, model, target_rate )
+                                recog_map[uid] = precog
+                            precog.AcceptWaveform( audio_bytes )
+                        if precog is not None:
+                            print("$",end="")
+                            txt = precog.FinalResult()
+                            stat.final(txt if txt else ' ')
                     await asyncio.sleep(0.03)
         except:
             traceback.print_exc()
@@ -505,6 +569,7 @@ class BotSession:
     async def _th_notify_task(self):
         try:
             xpause:bool = False
+            msg_buffer = {}
             while True:
                 await asyncio.sleep(0.01)
                 # 音声認識に結果があるか？             
@@ -519,19 +584,22 @@ class BotSession:
                 if self._res_task is not None:
                     self._res_task.pause(pause)
                 await asyncio.sleep(0.01)                
-                umsg = {}
                 for uid,stat in self.stt_stat.items():
                     mesg = stat.get_data()
                     if mesg:
                         print(f"[notify]uid:{uid} msg:{mesg}")
-                        accept, msg2 = await self.is_accept(mesg)
-                        if accept:
-                            umsg[uid] = msg2
-                if len(umsg)>0:
+                        msg_buffer[uid] = ' '.join([msg_buffer.get(uid,''),mesg]).strip()
+                accept:bool = False
+                if len(msg_buffer)>0:
+                    if self._res_task is not None:
+                        self._res_task.pause(True)
+                    accept = await self.is_accept(msg_buffer)
+                if accept:
                     # 実行中ならキャンセルする
                     if self._res_task is not None:
                         await self._res_task.cancel()
-                    asyncio.create_task( self._th_response_task(umsg,echoback=True,speech=True) )
+                    asyncio.create_task( self._th_response_task(msg_buffer,echoback=True,speech=True) )
+                    msg_buffer = {}
                     await asyncio.sleep(0.1)                
         except:
             traceback.print_exc()
@@ -550,13 +618,18 @@ class BotSession:
             return member.display_name
         return f"@{uid}"
 
-    async def is_accept(self,mesg) ->tuple[bool,str]:
-        llm = LLM2()
-        a,b,txt = await llm.th_get_response_from_openai(mesg)
-        stop= a<0
-        if txt and len(txt)>0 and txt!=mesg:
-            mesg = f"{mesg} (推測:{txt})"
-        return stop, mesg
+    async def is_accept(self,mesg:dict[int,str]) ->bool:
+        return True
+        # # とりあえず、ユーザひとりだけの前提で実装。
+        # is_break = False
+        # llm = LLM2()
+        # for uid,input_text in mesg.items():
+        #     s1,s2,update_text = await llm.th_is_accept_break(input_text)
+        #     if s1<0:
+        #         is_break = True
+        #     if update_text and len(update_text)>0 and update_text!=input_text:
+        #         mesg[uid] = f"{input_text} (推測:{update_text})"
+        # return is_break
 
     async def on_message(self, uid:int, user_content:str, echoback:bool=False, speech:bool=False ):
 
@@ -568,7 +641,7 @@ class BotSession:
         await asyncio.sleep(0.1)
 
     async def _th_response_task(self, umsg:dict[int,str], echoback:bool=False, speech:bool=False):
-        print(f"[MSG]start")
+        print(f"[#ResTask]start")
         try:
             if echoback:
                 for uid,user_content in umsg.items():
@@ -589,7 +662,7 @@ class BotSession:
                 self._global_messages.append( {'role':'assistant', 'content':ai_content})
         finally:
             self._res_task = None
-        print(f"[MSG]done")
+        print(f"[#ResTask]done")
 
 class ResponseTask:
 
@@ -634,15 +707,17 @@ class ResponseTask:
         self._pause = b
 
     async def cancel(self):
-        print("===try to cancel===")
+        print("[ResTask]cancel Start")
         try:
             self._llm.cancel()
             self._cancel = True
             await asyncio.sleep(0.1)
             while self._llm_task is not None or self._tts_task is not None or self._play_task is not None:
+                self.stop_play()
                 await asyncio.sleep(0.1)
         finally:
-            print("===finally cancel===")
+            print("[ResTask]cancel End")
+
     async def _th_llm(self):
         try:
             print(f"[LLM]start")
@@ -671,7 +746,7 @@ class ResponseTask:
                 if self._voice_client is not None and self._tts is not None:
                     voice_f32, model = await self._tts.a_text_to_audio_by_voicevox( ans, sampling_rate=48000 )
                     if voice_f32 is not None:
-                        audio_f32 = reverb( compressor(voice_f32) )
+                        audio_f32 = voice_f32 #reverb( compressor(voice_f32) )
                         # ステレオに変換（左右チャンネルに同じデータをコピー）
                         f32 = np.stack((audio_f32, audio_f32), axis=-1)
                         b_i16 = (f32*32767.0).astype(np.int16)
@@ -685,12 +760,37 @@ class ResponseTask:
             print(f"[TTS]done")
             self._tts_task = None
 
+    def is_connected(self) ->bool:
+        try:
+            return self._voice_client is not None and self._voice_client.is_connected()
+        except:
+            return False
+
+    def is_playing(self) ->bool:
+        try:
+            return self._voice_client is not None and self._voice_client.is_playing()
+        except:
+            return False
+
+    def is_paused(self) ->bool:
+        try:
+            return self._voice_client is not None and self._voice_client.is_paused()
+        except:
+            return False
+
+    def stop_play(self):
+        try:
+            if self._voice_client is not None:
+                self._voice_client.stop()
+        except:
+            return False
+
     async def _th_talk(self):
         try:
             print(f"[PLAY]start")
             emoji=""
             while True:
-                while self._play_pos>=len(self._audio_list) or self._pause or (self._voice_client and self._voice_client.is_playing()):
+                while self._play_pos>=len(self._audio_list) or self._pause or self.is_playing():
                     if self._cancel or self._tts_task is None:
                         break
                     await asyncio.sleep(0.2)
@@ -708,12 +808,12 @@ class ResponseTask:
                     break
                 src = self._audio_list[self._play_pos]
                 self._play_pos+=1
-                if src and self._voice_client:
-                    while self._voice_client.is_playing():
+                if src:
+                    while self.is_playing():
                         await asyncio.sleep(0.2)
-                    #self._voice_client.play(src, after=lambda e: print("[PLAY]end:", e))
                     try:
-                        self._voice_client.play(src)
+                        if self._voice_client and self.is_connected():
+                            self._voice_client.play(src)
                     except Exception as ex:
                         print(f"[PLAY]{ex}")
                     emoji="🔊"

@@ -107,7 +107,7 @@ class LLM2:
     def _is_llm_abort(self) ->bool:
         return self._cancel
     
-    async def th_get_response_from_openai(self, user_input:str, output:str|None = None, global_messages:list[dict]|None = None  ) ->tuple[int,int,str]:
+    async def th_is_accept_break(self, user_input:str, output:str|None = None, global_messages:list[dict]|None = None  ) ->tuple[int,int,str]:
         """
         OpenAIのAPIを使用してテキスト応答を取得する関数です。
         """
@@ -152,31 +152,32 @@ class LLM2:
         )
         text = stream.choices[0].message.content
         a1 = a2 = c1 = c2 = False
-        xx = ''
+        refined_text = ''
         if text:
-            print(text)
             a1 = "良好" in text
             a2 = "最悪" in text
             c1 = "継続" in text
             c2 = "中断" in text
             mark = "訂正したテキスト:"
-            for lines in text.splitlines():
-                f = lines.find(mark)
+            line_list = text.splitlines()
+            for line in line_list:
+                print(f"  # {line}")
+                f = line.find(mark)
                 if f>0:
-                    xx=lines[f+len(mark):]
-                    xx = re.sub(r'[。、「」]', '', xx)
-        a=0
+                    refined_text=line[f+len(mark):]
+                    refined_text = re.sub(r'[。、「」]', '', refined_text)
+        recog_quality=0
         if a1 and not a2:
-            a=1
+            recog_quality=1
         if not a1 and a2:
-            a=-1
-        c=0
+            recog_quality=-1
+        is_break=0
         if c1 and not c2:
-            c=1
+            is_break=1
         if not c1 and c2:
-            c=-1
-        print( f"{a} {c} {xx}")
-        return c,a,xx
+            is_break=-1
+        print( f"  # {is_break} {recog_quality} {refined_text}")
+        return is_break,recog_quality,refined_text
 
 async def test_llm2():
     llm = LLM2()
@@ -191,7 +192,7 @@ async def test_llm2():
     ]
     b = "ああ、政党のことですね！最近の政治の話題はとても興味深いですよね。特に、選挙や政策の変更があると、国の未来が大きく変わる可能性がありますし。しかし、政党の名前を聞くと、時々「何でこんな名前にしたんだろう？」って思うこともありますよね。例えば、"
     c = "あありんこ"
-    res = await llm.th_get_response_from_openai(c,b,a)
+    res = await llm.th_is_accept_break(c,b,a)
     print( res )
 
 if __name__ == "__main__":

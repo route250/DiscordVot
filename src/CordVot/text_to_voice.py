@@ -206,7 +206,7 @@ class TtsEngine:
         else:
             return text
 
-    async def a_text_to_audio_by_voicevox(self, text: str, *, sampling_rate: int) -> Tuple[Optional["AudioF32"], Optional[str]]:
+    async def a_text_to_audio_by_voicevox(self, text: str, *, sampling_rate: int) -> tuple[AudioF32|None, str|None]:
         sv_url: Optional[str] = await self.a_get_voicevox_url()
         if sv_url is None:
             return None, None
