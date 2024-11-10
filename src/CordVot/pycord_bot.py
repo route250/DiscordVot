@@ -495,17 +495,19 @@ class BotSession:
     async def _th_stt_task(self):
         target_rate = 48000
         recog_map:dict[int,UserRecognizer] = {}
+        seg_sec:float = 1.2
+        term_sec:float = 0.8
         try:
             is_connected:bool = True
             idx:int = 0
-            cut_time:float = 0.8
             while self.sink:
                 if self.voice_client is not None and not self.voice_client.is_connected():
                     if is_connected:
                         print(f"voice client is disconnected")
                         is_connected=False
                 original_rate:int = self.sink.sampling_rate
-                segment_sz:int = int(original_rate*0.8) # int(0.2*original_rate)
+                segment_sz:int = int(original_rate*seg_sec) # int(0.2*original_rate)
+
                 seg_list:list[AudioSeg] = self.sink.get_nowait()
                 if len(seg_list)>0:
                     idx = 0
@@ -524,7 +526,6 @@ class BotSession:
                             print(f"vosk create KaldiRecognizer")
                             recog = UserRecognizer( uid, model, target_rate )
                             recog_map[uid] = recog
-                        print(" *",end="")
                         if recog.AcceptWaveform( audio_bytes ):
                             txt = recog.Result()
                             stat.final(txt)
@@ -541,7 +542,7 @@ class BotSession:
                         precog:UserRecognizer|None = recog_map.get(uid)
                         if stat.total == 0 and (precog is None or not precog._drty):
                             continue
-                        if t<=cut_time:
+                        if t<=term_sec:
                             continue
                         if stat.total>0:
                             print(f"|{t}|",end="")
