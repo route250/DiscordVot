@@ -1,5 +1,6 @@
 import sys,os,io
 import time
+import copy
 import traceback
 from io import BytesIO
 import wave
@@ -25,7 +26,7 @@ import librosa
 from scipy.signal import resample as scipy_resample
 
 sys.path.append(os.getcwd())
-from rec_util import AudioF32, EmptyF32, load_wave, reverb, compressor
+from rec_util import AudioF32, AudioI16, EmptyF32, EmptyI16, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
 from llm import LLM,LLM2
 
@@ -67,19 +68,49 @@ class AudioSeg(NamedTuple):
     rcvt:float
     data:NDArray[np.float32]
 
+class AudioBuffer:
+
+    def __init__(self,uid):
+        self.uid = uid
+        self.rcvt:float = 0
+        self.aaa:list[AudioI16] = []
+
+    def put(self, rcvt:float, b:AudioI16 ):
+        self.rcvt = rcvt
+        self.aaa.append( b )
+
+    def get(self) ->tuple[float,AudioI16|None]:
+        now = time.time()
+        if len(self.aaa)==0:
+            return 0.0, None
+        if (now-self.rcvt)<0.8:
+            return self.rcvt, EmptyI16
+        print(f"<B{len(self.aaa)}>")
+        mono_i16:AudioI16 = np.concatenate(self.aaa)
+        self.aaa = []
+        # ゼロでない要素のインデックスを取得
+        non_zero_indices = np.nonzero(mono_i16)[0]
+        # スライス範囲を取得
+        if non_zero_indices.size == 0:
+            return self.rcvt, EmptyI16
+        start, end = non_zero_indices[0], non_zero_indices[-1] + 1
+        return self.rcvt, mono_i16[start:end]
+
 class BufSink(Sink):
     def __init__(self, *, filters=None):
         super().__init__( filters=filters)
         self.sampling_rate:int = 48000
         self.ch:int = 2
         self.width:int = 2
+        self.recvq:Queue = Queue()
         self.data_q:Queue[AudioSeg] = Queue()
         self.vol:float = 1.0
         self._audio_buf:list[AudioF32] = []
         self._zero_count:int = 0
         self._audo_active:bool = True
         self._save_idx:int=1
-        self._savebuf:BytesIO = BytesIO()
+        self._buf_map:dict[int,AudioBuffer] = {}
+        self._savebuf:dict[int,BytesIO] = {}
 
     def init(self, vc:discord.VoiceClient):  # called under listen
         super().init(vc)
@@ -94,71 +125,58 @@ class BufSink(Sink):
     @Filters.container
     def write(self, audio_bytes:bytes, uid:int):
         try:
-            # 音声データを変換
-            audio_i16:np.ndarray = np.frombuffer( audio_bytes, dtype=np.int16 )
-            stereo_i16 = audio_i16.reshape(-1,self.ch).copy()
-            mono_i16 = stereo_i16[:,0]
-            audio_f32 = mono_i16.astype(np.float32) / 32768.0
-            # 無音検知用
-            self._audio_buf.append(audio_f32)
-            if len(self._audio_buf)>20:
-                self._audio_buf.pop(0)
-            if max(audio_f32)<0.05:
-                self._zero_count+=1
-            else:
-                self._zero_count = 0
-            # 無音検知処理
-            if self._audo_active:
-                if self._zero_count>=500:
-                    print("[SINK]down")
-                    self._audo_active = False
-            else:
-                if self._zero_count == 0:
-                    self._audo_active = True
-                    print("[SINK]up")
-                    for a in self._audio_buf:
-                        self._putdata(uid,a)
-            # キューに保存
-            if self._audo_active:
-                self._putdata(uid,audio_f32)
+            self.recvq.put_nowait( (uid,time.time(),copy.copy(audio_bytes)) )
+        except:
+            pass
+
+    async def get_nowait(self) ->list[AudioSeg]:
+        ret:list[AudioSeg] = []
+        try:
+            while self.recvq.qsize()>0:
+                uid,rcvt,audio_bytes = self.recvq.get_nowait()
+                audio_i16 = np.frombuffer( audio_bytes, dtype=np.int16 )
+                stereo_i16 = audio_i16.reshape(-1,self.ch).copy()
+                mono_i16 = stereo_i16[:,0]
+                buf = self._buf_map.get(uid)
+                if buf is None:
+                    buf = AudioBuffer(uid)
+                    self._buf_map[uid] = buf
+                buf.put(rcvt,mono_i16)
+            
+            await asyncio.sleep(0.001)
+            for uid,buf in self._buf_map.items():
+                rcvt, mono_i16 = buf.get()
+                if mono_i16 is not None:
+                    audio_f32 = mono_i16.astype(np.float32) / 32768.0
+                    if len(mono_i16)>0:
+                        self.saveto( uid, mono_i16.tobytes() )
+                        amp = 0.8 / np.max(np.abs(audio_f32))
+                        audio_f32 *= amp
+                    seg = AudioSeg(uid,rcvt,audio_f32)
+                    ret.append(seg)
+            await asyncio.sleep(0.001)
         except:
             traceback.print_exc()
+        return ret
 
-    def _putdata(self, uid, audio_f32:AudioF32 ):
-        self.data_q.put(AudioSeg(uid,time.time(),audio_f32))
-        mono_i16 = (audio_f32 * 32767).astype(np.int16)
-        self._savebuf.write( mono_i16.tobytes() )
+    def saveto(self,uid, b):
+        wave_path = f"tmp/audio{self._save_idx:04d}.wav"
+        self._save_idx += 1
+        print(f"[SINK]save {wave_path}")
+        with wave.open(wave_path, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(self.width)
+            wf.setframerate(self.sampling_rate)
+            wf.writeframes(b)
 
     def cleanup(self):
         super().cleanup()
-
-    def get_nowait(self) ->list[AudioSeg]:
-        ret = []
-        try:
-            if self._savebuf.tell()>self.sampling_rate*30:
-                wave_path = f"tmp/audio{self._save_idx:04d}.wav"
-                self._save_idx += 1
-                self.saveto(wave_path)
-            while self.data_q.qsize()>0:
-                ret.append(self.data_q.get_nowait())
-        except:
-            pass
-        return ret
 
     # def get_all_audio(self):
     #     return None
 
     # def get_user_audio(self, user: snowflake.Snowflake):
     #     return None
-    def saveto(self,filename):
-        b = self._savebuf.getvalue()
-        self._savebuf.seek(0)
-        print(f"[SINK]save {filename}")
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(self.width)
-            wf.setframerate(self.sampling_rate)
-            wf.writeframes(b)
 
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
@@ -237,6 +255,7 @@ class MyBot(discord.Bot):
         self._add_commands()
         # session
         self._session_map:dict[sessionId,BotSession] = {}
+        self._text_ch = None
         #
         self.vc:discord.VoiceClient|None = None
         # vosk
@@ -328,6 +347,8 @@ class MyBot(discord.Bot):
         try:
             if mesg.author == self.user:
                 return
+            if self._text_ch is None or self._text_ch != mesg.channel.id:
+                return
             uid = mesg.author.id
             content = mesg.content
             session:BotSession|None = self._get_session2(mesg.channel)
@@ -339,16 +360,29 @@ class MyBot(discord.Bot):
             print(f"ERROR {ex}")
 
     def _add_commands(self):
-        @self.slash_command(description="ボイスチャンネルに参加します。")
+        @self.slash_command(description="テキストチャンネルにBOTを参加")
         async def join( ctx:ApplicationContext):
+            self._text_ch = ctx.channel_id
+            embed = discord.Embed(title="成功",description="テキストチャンネルに参加しました。",color=discord.Colour.green())
+            await ctx.respond(embed=embed)
+            return
+        @self.slash_command(description="テキストチャンネルにBOTを除外")
+        async def leave( ctx:ApplicationContext):
+            self._text_ch = None
+            embed = discord.Embed(title="成功",description="テキストチャンネルにから抜けました",color=discord.Colour.green())
+            await ctx.respond(embed=embed)
+            return
+        @self.slash_command(description="ボイスチャンネルに参加します。")
+        async def voice_on( ctx:ApplicationContext):
             try:
+                self._text_ch = ctx.channel_id
                 session:BotSession|None = self._get_session(ctx)
                 if session is None:
-                    embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
+                    embed = discord.Embed(title="エラー",description="事前に、あなたがボイスチャンネルに参加て下さい",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
                 if not isinstance(ctx.author,Member) or ctx.author.voice is None or ctx.author.voice.channel is None:
-                    embed = discord.Embed(title="エラー",description="あなたがボイスチャンネルに参加していません。",color=discord.Colour.red())
+                    embed = discord.Embed(title="エラー",description="事前に、あなたがボイスチャンネルに参加て下さい",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
                     return
                 if ctx.guild.voice_client is None or ctx.voice_client is None:
@@ -372,7 +406,7 @@ class MyBot(discord.Bot):
                 print(f"ERROR {ex}")
 
         @self.slash_command(description="ボイスチャンネルから切断します。")
-        async def leave(ctx:ApplicationContext):
+        async def voice_off(ctx:ApplicationContext):
             try:
                 if ctx.guild.voice_client is None:
                     embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
@@ -508,7 +542,7 @@ class BotSession:
                 original_rate:int = self.sink.sampling_rate
                 segment_sz:int = int(original_rate*seg_sec) # int(0.2*original_rate)
 
-                seg_list:list[AudioSeg] = self.sink.get_nowait()
+                seg_list:list[AudioSeg] = await self.sink.get_nowait()
                 if len(seg_list)>0:
                     idx = 0
                     for uid,rcvt,data in seg_list:
