@@ -11,7 +11,6 @@ from queue import Queue
 from typing import Type, Optional, NamedTuple
 import json
 
-from dotenv import load_dotenv
 import discord.opus
 import discord
 from discord import Message, Member, User
@@ -756,12 +755,6 @@ def main():
         os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
     BOT_PROMPT = config.get('bot_prompt_1')
     VOICEVOX_SPAKER = config.get('voicevox_speaker')
-
-    # .env ファイルから環境変数を読み込む
-    load_dotenv("discord.env")
-
-    # 環境変数からトークンを取得
-    TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
     if TOKEN is None:
         print("Error: DISCORD_BOT_TOKEN is not set in discord.env")
