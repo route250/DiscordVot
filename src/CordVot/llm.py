@@ -10,7 +10,8 @@ LLM_PROMPT:str = """音声会話型のAIのセリフを生成してください�
 何か話したいことある？と聞く代わりに、貴方の興味のある話題を初めてください。
 何か面白いことを聞かずに、貴方が面白いと感じたことを話して。
 人間の考えを聞くより人間の考えを予想しましょう。「どう思う？」と聞くより貴方の感想を話そう。
-話題がなかったら、ランダムで変な話を作って"""
+話題がなかったら、ランダムで変な話を作って
+テンポよく会話するために、短めのセリフにして下さい。"""
 
 def is_splitter(text:str) ->int:
     for w in ('、','!','?','！','？','。'):
@@ -21,8 +22,9 @@ def is_splitter(text:str) ->int:
 
 class LLM:
 
-    def __init__(self):
+    def __init__(self, prompt:str|None=None):
         self.run:bool = True
+        self.prompt:str = prompt if prompt else LLM_PROMPT
         self.llm_run:int = 0
         self.transcrib_id:int = 0
         self._cancel:bool = False
@@ -45,7 +47,7 @@ class LLM:
         openai_max_tokens = 1000  # 応答の最大長
         # リクエストを作ります
         local_messages = []
-        local_messages.append( {"role": "system", "content": LLM_PROMPT} )
+        local_messages.append( {"role": "system", "content": self.prompt} )
         for m in global_messages:
             local_messages.append( m )
         local_messages.append( {"role": "user", "content": user_input} )

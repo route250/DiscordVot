@@ -308,7 +308,7 @@ class TtsEngine:
         return text.strip()
 
 def main():
-    tts:TtsEngine = TtsEngine()
+    tts:TtsEngine = TtsEngine(speaker=81)
     a,model = tts._text_to_audio_by_voicevox('あいうえお',sampling_rate=16000)
     if a is not None:
         print( min(a) )

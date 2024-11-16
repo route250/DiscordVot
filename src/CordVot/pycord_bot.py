@@ -18,17 +18,16 @@ from discord import Message, Member, User
 from discord.channel import TextChannel, VoiceChannel
 from discord.commands.context import ApplicationContext
 from discord.commands import Option
-from discord.sinks import Sink, Filters
+from discord.sinks import Sink, Filters, MP3Sink
 import numpy as np
 from numpy.typing import NDArray
-import vosk
-import librosa
 from scipy.signal import resample as scipy_resample
 
 sys.path.append(os.getcwd())
 from rec_util import AudioF32, AudioI16, EmptyF32, EmptyI16, load_wave, reverb, compressor
 from text_to_voice import TtsEngine
 from llm import LLM,LLM2
+from vosk_server import VoskExecutor, VOSK_NOIZE
 
 class sessionId(NamedTuple):
     gid:int # guild id
@@ -85,7 +84,6 @@ class AudioBuffer:
             return 0.0, None
         if (now-self.rcvt)<0.8:
             return self.rcvt, EmptyI16
-        print(f"<B{len(self.aaa)}>")
         mono_i16:AudioI16 = np.concatenate(self.aaa)
         self.aaa = []
         # ゼロでない要素のインデックスを取得
@@ -111,6 +109,7 @@ class BufSink(Sink):
         self._save_idx:int=1
         self._buf_map:dict[int,AudioBuffer] = {}
         self._savebuf:dict[int,BytesIO] = {}
+        self._max_amp:float = 0.0
 
     def init(self, vc:discord.VoiceClient):  # called under listen
         super().init(vc)
@@ -148,9 +147,9 @@ class BufSink(Sink):
                 rcvt, mono_i16 = buf.get()
                 if mono_i16 is not None:
                     audio_f32 = mono_i16.astype(np.float32) / 32768.0
-                    if len(mono_i16)>0:
-                        self.saveto( uid, mono_i16.tobytes() )
-                        amp = 0.8 / np.max(np.abs(audio_f32))
+                    if len(mono_i16)>4800:
+                        self._max_amp = max( self._max_amp, float(np.max(np.abs(audio_f32))))
+                        amp = 0.8 / self._max_amp
                         audio_f32 *= amp
                     seg = AudioSeg(uid,rcvt,audio_f32)
                     ret.append(seg)
@@ -159,96 +158,14 @@ class BufSink(Sink):
             traceback.print_exc()
         return ret
 
-    def saveto(self,uid, b):
-        wave_path = f"tmp/audio{self._save_idx:04d}.wav"
-        self._save_idx += 1
-        print(f"[SINK]save {wave_path}")
-        with wave.open(wave_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(self.width)
-            wf.setframerate(self.sampling_rate)
-            wf.writeframes(b)
-
-    def cleanup(self):
-        super().cleanup()
-
-    # def get_all_audio(self):
-    #     return None
-
-    # def get_user_audio(self, user: snowflake.Snowflake):
-    #     return None
-
+    def format_audio(self, audio):
+        pass
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 MODEL_NAME_LARGE = "vosk-model-ja-0.22"
-IGNORE2="{\n  \"text\" : \"\"\n}"
-IGNORE1="{\n  \"partial\" : \"\"\n}"
-IGNORE3="{\"text\": \"\"}"
-VOSK_IGNORE_WARDS = {
-    'えー', 'えええ', 'あっ'
-}
-
-def strip_vosk_text( text:str ) ->str|None:
-    text = text.strip() if isinstance(text,str) else ''
-    if len(text)==0:
-        return None
-    results = ''
-    for w in text.split():
-        if len(w)>1 and not w in VOSK_IGNORE_WARDS:
-            results += w
-    return results if len(results)>0 else None
-
-class UserRecognizer:
-    def __init__(self,uid:int, model,sr):
-        self.uid:int = uid
-        self.recog = vosk.KaldiRecognizer( model, sr )
-        self._drty:bool = False
-        self._last_use:float = time.time()
-        self._pre:int = 4000
-
-    def AcceptWaveform(self,data) ->bool:
-        self._last_use:float = time.time()
-        if not self._drty:
-            self._drty = True
-            if len(data)>self._pre:
-                data = data[:self._pre] + data
-            else:
-                data = b'\0'*self._pre + data + data
-        return self.recog.AcceptWaveform(data)
-    
-    def Result(self) ->str|None:
-        try:
-            dat = json.loads(self.recog.Result())
-            return strip_vosk_text( dat.get('text') )
-        except:
-            return None
-
-    def PartialResult(self):
-        try:
-            dat = json.loads(self.recog.PartialResult())
-            return strip_vosk_text( dat.get('text') )
-        except:
-            return None
-
-    def FinalResult(self) ->str|None:
-        try:
-            if self._drty:
-                self._drty = False
-                self._last_use:float = time.time()
-                dat = json.loads(self.recog.FinalResult())
-                return strip_vosk_text( dat.get('text') )
-        except:
-            pass
-        finally:
-            self.recog.Reset()
-        return None
-
-    def Reset(self):
-        self._drty = False
-        self.recog.Reset()
 
 class MyBot(discord.Bot):
-    def __init__(self):
+    def __init__(self, *, prompt1:str|None=None, speaker=None, audio_log:str|None=None):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
@@ -260,11 +177,13 @@ class MyBot(discord.Bot):
         self.vc:discord.VoiceClient|None = None
         # vosk
         self.vosk_model_name:str = MODEL_NAME_LARGE
-        self.vosk_model:vosk.Model|None = None
         self.vosk_map:dict = {}
         self._load_task = None
         #
-        self.tts:TtsEngine = TtsEngine()
+        self.prompt1:str|None = prompt1
+        spk = speaker if isinstance(speaker,int) else 8
+        self.tts:TtsEngine = TtsEngine(speaker=spk)
+        self.audio_log:str|None = audio_log
 
     def _get_session(self, ctx:ApplicationContext|sessionId|None) -> Optional["BotSession"]:
         if isinstance(ctx,sessionId):
@@ -277,7 +196,7 @@ class MyBot(discord.Bot):
         session:BotSession|None = self._session_map.get(sid)
         if session is not None:
             return session
-        session = BotSession(self, ctx.channel )
+        session = BotSession(self, ctx.channel, audio_log=self.audio_log )
         self._session_map[sid] = session
         return session
 
@@ -288,25 +207,9 @@ class MyBot(discord.Bot):
         session:BotSession|None = self._session_map.get(sid)
         if session is not None:
             return session
-        session = BotSession(self, ch, None )
+        session = BotSession(self, ch, None, audio_log=self.audio_log )
         self._session_map[sid] = session
         return session
-
-    async def _th_load_vosk_model(self):
-        # VOSKモデルの読み込み
-        model = self.vosk_model
-        if model is None:
-            print(f"vosk load {self.vosk_model_name}")
-            vosk.SetLogLevel(-1)
-            model = vosk.Model(model_name=self.vosk_model_name)
-            self.vosk_model = model
-
-    async def get_vosk_model(self) ->vosk.Model:
-        if self.vosk_model is None and self._load_task is None:
-            self._load_task = asyncio.create_task(self._th_load_vosk_model())
-        while self.vosk_model is None:
-            await asyncio.sleep(0.1)
-        return self.vosk_model
 
     async def uid_to_name(self,gid:int,uid:int) ->str:
         guild = self.get_guild(gid)
@@ -336,7 +239,6 @@ class MyBot(discord.Bot):
 
     async def on_ready(self):
         print(f"on_ready")
-        self._load_task = asyncio.create_task(self._th_load_vosk_model())
     
     async def on_disconnect(self):
         print(f"on_disconnect")
@@ -439,7 +341,7 @@ class VoiceStat:
         return a
 
     def partial(self,msg:str):
-        if self._partial or msg:
+        if (self._partial or msg) and self._partial != msg:
             print(f"[VOICE] partial {msg}")
         self._partial = msg
 
@@ -465,7 +367,7 @@ class VoiceStat:
             return ret
         return ''
 
-def convert_audio(xaudio,original_rate,target_rate) ->bytes:
+def convert_audio(xaudio:AudioF32,original_rate,target_rate) ->bytes:
     if len(xaudio)==0:
         return b''
     if target_rate == original_rate:
@@ -484,7 +386,7 @@ class VoiceRes(NamedTuple):
 
 class BotSession:
 
-    def __init__(self, bot:MyBot, ch, voice_client:discord.VoiceClient|None=None):
+    def __init__(self, bot:MyBot, ch, voice_client:discord.VoiceClient|None=None, audio_log:str|None=None ):
         self.bot:MyBot = bot
         sid:sessionId|None = sessionId.from_channel(ch)
         if sid is None:
@@ -499,9 +401,12 @@ class BotSession:
         self.stt_stat:dict[int,VoiceStat] = {}
         self.sink:BufSink|None = None
         #
+        self.prompt1:str|None = bot.prompt1
         self._res_task = None
         #
         self._global_messages:list[dict] = []
+        #
+        self.audio_log:str|None = audio_log
 
     async def start(self):
         if self._stt_task is None:
@@ -527,71 +432,38 @@ class BotSession:
         return False
 
     async def _th_stt_task(self):
-        target_rate = 48000
-        recog_map:dict[int,UserRecognizer] = {}
-        seg_sec:float = 1.2
-        term_sec:float = 0.8
         try:
+            executor = VoskExecutor( audio_log=self.audio_log)
             is_connected:bool = True
-            idx:int = 0
             while self.sink:
+                await asyncio.sleep(0.0001)
                 if self.voice_client is not None and not self.voice_client.is_connected():
                     if is_connected:
                         print(f"voice client is disconnected")
                         is_connected=False
                 original_rate:int = self.sink.sampling_rate
-                segment_sz:int = int(original_rate*seg_sec) # int(0.2*original_rate)
-
                 seg_list:list[AudioSeg] = await self.sink.get_nowait()
-                if len(seg_list)>0:
-                    idx = 0
-                    for uid,rcvt,data in seg_list:
+                for uid,rcvt,audio_f32 in seg_list:
+                    if audio_f32 is not None:
                         stat = self.stt_stat.get(uid)
                         if stat is None:
                             stat = self.stt_stat[uid] = VoiceStat(uid)
-                        stat.add_audio(rcvt,data)
-                        if stat.total<segment_sz:
-                            continue
-                        audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
-                        if uid in recog_map:
-                            recog:UserRecognizer = recog_map[uid]
-                        else:
-                            model = await self.bot.get_vosk_model()
-                            print(f"vosk create KaldiRecognizer")
-                            recog = UserRecognizer( uid, model, target_rate )
-                            recog_map[uid] = recog
-                        if recog.AcceptWaveform( audio_bytes ):
-                            txt = recog.Result()
-                            stat.final(txt)
-                        else:
-                            txt = recog.PartialResult()
-                            if txt:
-                                stat.partial(txt)
-                    await asyncio.sleep(0.03)
-                else:
-                    idx+=1
-                    now = time.time()
-                    for uid,stat in self.stt_stat.items():
-                        t = now - stat._rcvt
-                        precog:UserRecognizer|None = recog_map.get(uid)
-                        if stat.total == 0 and (precog is None or not precog._drty):
-                            continue
-                        if t<=term_sec:
-                            continue
-                        if stat.total>0:
-                            print(f"|{t}|",end="")
-                            audio_bytes = convert_audio( stat.get_audio(), original_rate, target_rate )
-                            if precog is None:
-                                model = await self.bot.get_vosk_model()
-                                print(f"vosk create KaldiRecognizer")
-                                precog = UserRecognizer( uid, model, target_rate )
-                                recog_map[uid] = precog
-                            precog.AcceptWaveform( audio_bytes )
-                        if precog is not None:
-                            print("$",end="")
-                            txt = precog.FinalResult()
-                            stat.final(txt if txt else ' ')
-                    await asyncio.sleep(0.03)
+                        stat.partial('....')
+                        if len(audio_f32)>0:
+                            lv = np.max(np.abs(audio_f32))
+                            if lv>executor.threshold:
+                                retx = await executor.asubmit_audio(audio_f32,original_rate)
+                                print(f"vosk {json.dumps(retx,ensure_ascii=False)}")
+                                txta = retx.get('text')
+                                if txta and txta!=VOSK_NOIZE:
+                                    stat.final(txta)
+                                    stat.final(' ')
+                                else:
+                                    stat.final(None)
+                            else:
+                                stat.final(None)
+                    else:
+                        stat.final(None)
         except:
             traceback.print_exc()
         finally:
@@ -613,7 +485,6 @@ class BotSession:
                     if stat.have_data():
                         pause = True
                 if xpause != pause:
-                    print(f"[notify]pause:{pause}")
                     xpause = pause
                 # 結果があれば一時停止をかける
                 if self._res_task is not None:
@@ -689,7 +560,7 @@ class BotSession:
             dicord_msg:discord.message.Message = await self.ch.send( '......' )
             tts = self.bot.tts if speech else None
             vc = self.voice_client if speech else None
-            self._res_task = t = ResponseTask( dicord_msg, self._global_messages, user_content, tts=tts, voice_client=vc )
+            self._res_task = t = ResponseTask( dicord_msg, self._global_messages, user_content, prompt=self.prompt1, tts=tts, voice_client=vc )
             ai_content:str = await t.start()
             if user_content:
                 self._global_messages.append( {'role':'user', 'content':user_content})
@@ -701,7 +572,7 @@ class BotSession:
 
 class ResponseTask:
 
-    def __init__(self, msg:discord.message.Message, messages:list[dict], user_content:str, *, tts:TtsEngine|None, voice_client:discord.VoiceClient|None):
+    def __init__(self, msg:discord.message.Message, messages:list[dict], user_content:str, *,prompt:str|None=None, tts:TtsEngine|None, voice_client:discord.VoiceClient|None):
         self.dmsg:discord.message.Message = msg
         self._message:list[dict] = messages
         self._user_content = user_content
@@ -710,7 +581,7 @@ class ResponseTask:
         self._pause:bool = False
         #
         # LLM
-        self._llm:LLM = LLM()
+        self._llm:LLM = LLM(prompt=prompt)
         self._llm_task = None
         self._llm_response_list:list[str] = []
         #
@@ -876,6 +747,16 @@ def generate_sine_wave_bytes(duration=1):
     return buffer
 
 def main():
+    with open('discvot.json','r') as f:
+        config = json.load(f)
+    
+    TOKEN = config['discord_bot_token']
+    OPENAI_API_KEY=config.get('openai_api_key')
+    if OPENAI_API_KEY:
+        os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
+    BOT_PROMPT = config.get('bot_prompt_1')
+    VOICEVOX_SPAKER = config.get('voicevox_speaker')
+
     # .env ファイルから環境変数を読み込む
     load_dotenv("discord.env")
 
@@ -894,7 +775,8 @@ def main():
                     discord.opus.load_opus(l)
                 except:
                     pass
-    bot = MyBot()
+    audio_log = 'tmp/audiolog'
+    bot = MyBot( prompt1=BOT_PROMPT, speaker=VOICEVOX_SPAKER, audio_log=audio_log)
     bot.run(TOKEN)
 
 if __name__ == "__main__":
