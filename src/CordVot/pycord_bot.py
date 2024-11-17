@@ -164,7 +164,7 @@ MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 MODEL_NAME_LARGE = "vosk-model-ja-0.22"
 
 class MyBot(discord.Bot):
-    def __init__(self, *, prompt1:str|None=None, speaker=None, audio_log:str|None=None):
+    def __init__(self, *, config:dict={}, audio_log:str|None=None):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
@@ -179,9 +179,8 @@ class MyBot(discord.Bot):
         self.vosk_map:dict = {}
         self._load_task = None
         #
-        self.prompt1:str|None = prompt1
-        spk = speaker if isinstance(speaker,int) else 8
-        self.tts:TtsEngine = TtsEngine(speaker=spk)
+        self.prompt1:str|None = config.get('bot_prompt_1')
+        self.tts:TtsEngine = TtsEngine( config=config )
         self.audio_log:str|None = audio_log
 
     def _get_session(self, ctx:ApplicationContext|sessionId|None) -> Optional["BotSession"]:
@@ -750,11 +749,15 @@ def main():
         config = json.load(f)
     
     TOKEN = config['discord_bot_token']
+    del config['discord_bot_token']
     OPENAI_API_KEY=config.get('openai_api_key')
     if OPENAI_API_KEY:
         os.environ['OPENAI_API_KEY'] = OPENAI_API_KEY
+        del config['openai_api_key']
     BOT_PROMPT = config.get('bot_prompt_1')
     VOICEVOX_SPAKER = config.get('voicevox_speaker')
+    VOICEVOX_SPEED = config.get('voicevox_speed')
+    VOICEVOX_PITCH = config.get('voicevox_pitch')
 
     if TOKEN is None:
         print("Error: DISCORD_BOT_TOKEN is not set in discord.env")
@@ -769,7 +772,7 @@ def main():
                 except:
                     pass
     audio_log = 'tmp/audiolog'
-    bot = MyBot( prompt1=BOT_PROMPT, speaker=VOICEVOX_SPAKER, audio_log=audio_log)
+    bot = MyBot( config=config, audio_log=audio_log)
     bot.run(TOKEN)
 
 if __name__ == "__main__":

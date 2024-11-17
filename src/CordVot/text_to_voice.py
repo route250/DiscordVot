@@ -142,12 +142,23 @@ class TtsEngine:
         gender = voice[3] if voice else None
         return gender if gender else 'X'
 
-    def __init__(self, *, speaker:int=8, katakana_dir='tmp/katakana' ):
+    def __init__(self, *, config:dict={}, katakana_dir='tmp/katakana' ):
         # 発声中のセリフのID
         self._talk_id: int = 0
         self._talk_seq: int = 0
         # 音声エンジン選択
-        self.speaker = speaker
+        self.speaker = 8
+        self.speed = 1.0
+        self.pitch = 0.0
+        VOICEVOX_SPAKER = config.get('voicevox_speaker')
+        if isinstance(VOICEVOX_SPAKER,int):
+            self.speaker = VOICEVOX_SPAKER
+        VOICEVOX_SPEED = config.get('voicevox_speed')
+        if isinstance(VOICEVOX_SPEED,int|float):
+            self.speed = float(VOICEVOX_SPEED)
+        VOICEVOX_PITCH = config.get('voicevox_pitch')
+        if isinstance(VOICEVOX_PITCH,int|float):
+            self.pitch = float(VOICEVOX_PITCH)
         # VOICEVOXサーバURL
         self._voicevox_url:str|None = None
         self._voicevox_port = _to_int( os.getenv('VOICEVOX_PORT' ), 50021)
@@ -224,9 +235,9 @@ class TtsEngine:
 
                 # パラメータの調整
                 ss: float = res1_json.get('speedScale', 1.0)
-                res1_json['speedScale'] = ss * 1.1
+                res1_json['speedScale'] = ss * self.speed
                 ps: float = res1_json.get('pitchScale', 0.0)
-                res1_json['pitchScale'] = ps - 0.1
+                res1_json['pitchScale'] = ps + self.pitch
 
                 # synthesisエンドポイントへのPOSTリクエスト
                 data = json.dumps(res1_json, ensure_ascii=False)
@@ -308,7 +319,8 @@ class TtsEngine:
         return text.strip()
 
 def main():
-    tts:TtsEngine = TtsEngine(speaker=81)
+    config={ 'voicevox_speaker': 81 }
+    tts:TtsEngine = TtsEngine(config=config)
     a,model = tts._text_to_audio_by_voicevox('あいうえお',sampling_rate=16000)
     if a is not None:
         print( min(a) )
