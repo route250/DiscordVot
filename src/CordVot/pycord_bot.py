@@ -93,22 +93,14 @@ class AudioBuffer:
         start, end = non_zero_indices[0], non_zero_indices[-1] + 1
         return self.rcvt, mono_i16[start:end]
 
-class BufSink(Sink):
+class StreamSink(Sink):
     def __init__(self, *, filters=None):
         super().__init__( filters=filters)
         self.sampling_rate:int = 48000
         self.ch:int = 2
         self.width:int = 2
-        self.recvq:Queue = Queue()
-        self.data_q:Queue[AudioSeg] = Queue()
-        self.vol:float = 1.0
-        self._audio_buf:list[AudioF32] = []
-        self._zero_count:int = 0
-        self._audo_active:bool = True
-        self._save_idx:int=1
+        self._rcv_queue:Queue = Queue()
         self._buf_map:dict[int,AudioBuffer] = {}
-        self._savebuf:dict[int,BytesIO] = {}
-        self._max_amp:float = 0.0
 
     def init(self, vc:discord.VoiceClient):  # called under listen
         super().init(vc)
@@ -116,22 +108,46 @@ class BufSink(Sink):
             self.sampling_rate = vc.decoder.SAMPLING_RATE
             self.ch = vc.decoder.CHANNELS
             self.width = vc.decoder.SAMPLE_SIZE // vc.decoder.CHANNELS
-            print(f"buf {self.sampling_rate} {self.ch} {self.width}")
+            print(f"[SINK] {self.sampling_rate} {self.ch} {self.width}")
         else:
             print(f"ERROR: buf init, vc is None")
 
     @Filters.container
     def write(self, audio_bytes:bytes, uid:int):
         try:
-            self.recvq.put_nowait( (uid,time.time(),copy.copy(audio_bytes)) )
+            self._rcv_queue.put_nowait( (uid,time.time(),copy.copy(audio_bytes)) )
         except:
             pass
+
+    def cleanup(self):
+        print("[SINK]cleanup")
+        try:
+            super().cleanup()
+        except:
+            traceback.print_exc()
+        try:
+            self._buf_map = {}
+            while self._rcv_queue.qsize()>0:
+                self._rcv_queue.get_nowait()
+        except:
+            pass
+
+    def format_audio(self, audio):
+        print("[SINK]format_audio")
+    
+    def get_all_audio(self):
+        print("[SINK]get_all_audio")
+        return []
+
+    def get_user_audio(self, user):
+        print("[SINK]get_user_audio")
+        return ""
 
     async def get_nowait(self) ->list[AudioSeg]:
         ret:list[AudioSeg] = []
         try:
-            while self.recvq.qsize()>0:
-                uid,rcvt,audio_bytes = self.recvq.get_nowait()
+            while self._rcv_queue.qsize()>0:
+                uid,rcvt,audio_bytes = self._rcv_queue.get_nowait()
                 audio_i16 = np.frombuffer( audio_bytes, dtype=np.int16 )
                 stereo_i16 = audio_i16.reshape(-1,self.ch).copy()
                 mono_i16 = stereo_i16[:,0]
@@ -146,19 +162,14 @@ class BufSink(Sink):
                 rcvt, mono_i16 = buf.get()
                 if mono_i16 is not None:
                     audio_f32 = mono_i16.astype(np.float32) / 32768.0
-                    if len(mono_i16)>4800:
-                        self._max_amp = max( self._max_amp, float(np.max(np.abs(audio_f32))))
-                        amp = 0.8 / self._max_amp
-                        audio_f32 *= amp
                     seg = AudioSeg(uid,rcvt,audio_f32)
                     ret.append(seg)
             await asyncio.sleep(0.001)
+        except asyncio.exceptions.CancelledError as ex:
+            raise ex
         except:
             traceback.print_exc()
         return ret
-
-    def format_audio(self, audio):
-        pass
 
 MODEL_NAME_SMALL = "vosk-model-small-ja-0.22"
 MODEL_NAME_LARGE = "vosk-model-ja-0.22"
@@ -183,7 +194,7 @@ class MyBot(discord.Bot):
         self.tts:TtsEngine = TtsEngine( config=config )
         self.audio_log:str|None = audio_log
 
-    def _get_session(self, ctx:ApplicationContext|sessionId|None) -> Optional["BotSession"]:
+    def _get_session_by_ctx(self, ctx:ApplicationContext|sessionId|None) -> Optional["BotSession"]:
         if isinstance(ctx,sessionId):
             return self._session_map.get(ctx)
         if not isinstance(ctx,ApplicationContext):
@@ -198,7 +209,7 @@ class MyBot(discord.Bot):
         self._session_map[sid] = session
         return session
 
-    def _get_session2(self, ch ) -> Optional["BotSession"]:
+    def _get_session_by_ch(self, ch ) -> Optional["BotSession"]:
         sid:sessionId|None = sessionId.from_channel(ch)
         if sid is None:
             return None
@@ -251,7 +262,7 @@ class MyBot(discord.Bot):
                 return
             uid = mesg.author.id
             content = mesg.content
-            session:BotSession|None = self._get_session2(mesg.channel)
+            session:BotSession|None = self._get_session_by_ch(mesg.channel)
             if session:
                 if uid and content:
                     await session.on_message( uid, content )
@@ -276,7 +287,7 @@ class MyBot(discord.Bot):
         async def voice_on( ctx:ApplicationContext):
             try:
                 self._text_ch = ctx.channel_id
-                session:BotSession|None = self._get_session(ctx)
+                session:BotSession|None = self._get_session_by_ctx(ctx)
                 if session is None:
                     embed = discord.Embed(title="エラー",description="事前に、あなたがボイスチャンネルに参加て下さい",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
@@ -298,7 +309,7 @@ class MyBot(discord.Bot):
                     return
                 session.voice_client = ctx.voice_client
                 await session.start()
-                session.sink = BufSink()
+                session.sink = StreamSink()
                 ctx.voice_client.start_recording(session.sink, session.sink_finished_callback )
                 embed = discord.Embed(title="成功",description="ボイスチャンネルに参加しました。",color=discord.Colour.green())
                 await ctx.respond(embed=embed)
@@ -308,6 +319,12 @@ class MyBot(discord.Bot):
         @self.slash_command(description="ボイスチャンネルから切断します。")
         async def voice_off(ctx:ApplicationContext):
             try:
+                self._text_ch = ctx.channel_id
+                session:BotSession|None = self._get_session_by_ctx(ctx)
+                if session is not None:
+                    await session.stop()
+                    session.voice_client = None
+                    session.sink = None
                 if ctx.guild.voice_client is None:
                     embed = discord.Embed(title="エラー",description="ボイスチャンネルに接続していません。",color=discord.Colour.red())
                     await ctx.respond(embed=embed)
@@ -397,7 +414,7 @@ class BotSession:
         self._stt_task:Task|None = None
         self._notify_task:Task|None = None
         self.stt_stat:dict[int,VoiceStat] = {}
-        self.sink:BufSink|None = None
+        self.sink:StreamSink|None = None
         #
         self.prompt1:str|None = bot.prompt1
         self._res_task = None
@@ -434,6 +451,9 @@ class BotSession:
             executor = VoskExecutor( audio_log=self.audio_log)
             is_connected:bool = True
             while self.sink:
+                if self.voice_client is None or self.sink is None:
+                    print(f"[STT] break")
+                    break
                 await asyncio.sleep(0.0001)
                 if self.voice_client is not None and not self.voice_client.is_connected():
                     if is_connected:
@@ -462,6 +482,8 @@ class BotSession:
                                 stat.final(None)
                     else:
                         stat.final(None)
+        except asyncio.exceptions.CancelledError as ex:
+            print(f"[STT] CancelledError {str(ex)}")
         except:
             traceback.print_exc()
         finally:

@@ -48,7 +48,7 @@ class LLM:
         # リクエストを作ります
         local_messages = []
         local_messages.append( {"role": "system", "content": self.prompt} )
-        for m in global_messages:
+        for m in global_messages[-10:]:
             local_messages.append( m )
         local_messages.append( {"role": "user", "content": user_input} )
         
