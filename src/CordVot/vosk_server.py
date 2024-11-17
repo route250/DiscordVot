@@ -31,6 +31,27 @@ VOSK_IGNORE_WARDS = {
     'えー', 'えええ', 'あっ'
 }
 VOSK_NOIZE='<|noize|>'
+
+
+# ベクトル化されたaaaa関数
+def audio_normalize( x: np.ndarray, ix:float, xmax:float, iy:float, ymax:float ) -> np.ndarray:
+
+    dx1 = iy / ix
+    dx2 = (ymax - iy) / (xmax - ix)
+
+    # 条件を満たすインデックスを取得
+    abs_x = np.abs(x)
+    condition = abs_x < ix
+    
+    # numpy配列を用意
+    y = np.empty_like(abs_x)
+
+    # 条件に基づいて計算
+    y[condition] = abs_x[condition] * dx1
+    y[~condition] = iy + (abs_x[~condition] - ix) * dx2
+    
+    return y * np.sign(x)
+
 class VoskProcessor:
 
     @staticmethod
@@ -107,18 +128,28 @@ class VoskProcessor:
         """
         音声を処理して認識結果を返す
         """
+        resp = {}
         try:
+
+            sec = round( len(audio_f32) / vosk_sr , 3 )
+            resp['audio_sec'] = sec
+            if sec<0.2:
+                resp["error"]="Audio is short"
+                return resp
             audio_abs = np.abs(audio_f32)
             lv_max = np.max(audio_abs)
+            resp['lv_max'] = round( float(lv_max),4)
             if lv_max<self.threshold:
-                lv_max = round( float(lv_max),4)
-                return {"error": "Audio is silent","lv_max":lv_max}
+                resp["error"]="Audio is silent"
+                return resp
             # ゼロでない要素のインデックスを取得
             non_zero_indices = np.where(audio_abs>1e-9)[0]
             # スライス範囲を取得
             if non_zero_indices.size == 0:
-                return {"error": "Audio is silent","lv_max":lv_max}
+                resp["error"]="Audio is silent"
+                return resp
             start, end = non_zero_indices[0], non_zero_indices[-1] + 1
+            resp['voice_sec'] = round( (end-start)/vosk_sr, 4 )
             audio_f32 = audio_f32[start:end]
             audio_abs = audio_abs[start:end]
             # 音量を計算
@@ -127,13 +158,15 @@ class VoskProcessor:
             audio_abs2 = non_zero[non_zero<x]
             lv_mean = np.mean(audio_abs2)
             lv_std_dev = np.std(audio_abs2)
-            lv = norm.ppf(0.8, loc=lv_mean, scale=lv_std_dev)
-            r1 = 0.1/lv
-            r2 = 0.8/lv_max
-            rr = max(r1,r2)
+            lv2 = norm.ppf(0.8, loc=lv_mean, scale=lv_std_dev)
+            lv=float(lv2)
+            resp['lv_mean'] = round( float(lv),4)
+            if lv<self.threshold:
+                resp["error"]="Audio is silent"
+                return resp
             print(f"audio range {lv_max:.3f}-{lv_std_dev:.3f} mean:{lv_mean:.3f} lv:{lv:.3f}")
-            rr = 32767 * rr
-            audio_f32 *= rr
+            target_lv = 32767 * 0.6
+            audio_f32 = audio_normalize(audio_f32, lv, lv_max, target_lv*0.2, target_lv )
             audio_f32 = np.clip(-32767,32767,audio_f32)
 
             audio_bytes = audio_f32.astype(np.int16).tobytes()
@@ -151,6 +184,8 @@ class VoskProcessor:
             if text:
                 raw_results.append(text)
             raw_text = ' '.join(raw_results)
+            resp['raw'] = raw_text
+            resp['text'] = raw_text
             res = []
             nz:bool = False
             for t in raw_results:
@@ -169,9 +204,8 @@ class VoskProcessor:
             else:
                 text = ''.join(res).replace(' ','')
 
-            lv_max = round( float(lv_max),4)
-            lv = round( float(lv),4 )
-            return {"text": text, "raw":raw_text, "lv_max": lv_max, "lv_mean": lv}
+            resp['text'] = text
+            return resp
         except Exception as e:
             traceback.print_exc()
             return {"error": str(e)}
@@ -222,7 +256,7 @@ class VoskProcessor:
 
 class VoskExecutor():
 
-    def __init__(self, max_workers:int=4, threshold:float=0.2, audio_log:str|None=None):
+    def __init__(self, max_workers:int=4, threshold:float=0.02, audio_log:str|None=None):
         self.threshold:float = threshold
         self.executor = ProcessPoolExecutor(max_workers=max_workers,initializer=VoskProcessor.initializer, initargs=(threshold,audio_log,))
 
@@ -248,9 +282,9 @@ class VoskExecutor():
         return result
 
 class SttServer(Flask):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.executor = VoskExecutor()
+    def __init__(self, import_name:str, max_workers:int=4, threshold:float=0.02, audio_log:str|None=None, *args, **kwargs):
+        super().__init__( import_name, *args, **kwargs)
+        self.executor = VoskExecutor( max_workers=max_workers, threshold=threshold, audio_log=audio_log )
         self.add_url_rule('/recognize', 'recognize_audio', self.recognize_audio, methods=['POST'])
 
     def recognize_audio(self):
@@ -271,7 +305,7 @@ def start_server():
     """
     Flaskサーバーをバックグラウンドで起動
     """
-    app = SttServer(__name__)
+    app = SttServer(__name__, threshold=0.02)
     server_thread = threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5007, debug=False, use_reloader=False))
     server_thread.daemon = True  # プロセス終了時にスレッドも終了
     server_thread.start()
