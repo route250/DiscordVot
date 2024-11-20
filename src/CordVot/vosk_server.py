@@ -54,14 +54,14 @@ def audio_aaa( audio:NDArray[np.float32], sr:int, w:float=0.2, threshold:float=1
     zero_up_idx = np.where( (audio_abs[:-1] <= threshold) & (audio_abs[1:]>threshold))[0]
     zero_up_idx += 1
 
-def nomlize_audio( audio:NDArray[np.float32], sr:int, target_lv:float=0.8 ) ->NDArray[np.float32]:
-    coef, _,_ = generate_peak_coefficients( audio, sr )
+def nomlize_audio( audio:NDArray[np.float32], sr:int, *, target_lv:float=0.8, signal_threshold:float=1e-9 ) ->NDArray[np.float32]:
+    coef, _,_ = generate_peak_coefficients( audio, sr, signal_threshold=signal_threshold )
     a = audio *coef
     max_lv = np.max(np.abs(a))
     r = target_lv / max_lv
     return a*r
 
-def generate_peak_coefficients(audio: NDArray[np.float32], sr: int, seg: float = 0.02, dbg:bool=False) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+def generate_peak_coefficients(audio: NDArray[np.float32], sr: int, seg: float = 0.02, signal_threshold:float=1e-9, dbg:bool=False) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
     audio_length: int = len(audio)
     seg_width: int = int(sr * seg)  # サンプリングレートと区間の長さに基づいて、区間の幅をサンプル数で計算
 
@@ -69,9 +69,10 @@ def generate_peak_coefficients(audio: NDArray[np.float32], sr: int, seg: float =
     audio_abs = np.abs(audio)
 
     # 各区間内の最大値を見つける (ループをnumpy演算に変更して高速化)
-    reshaped_audio_abs = audio_abs[:audio_length - (audio_length % seg_width)].reshape(-1, seg_width)
+    l2 = audio_length - (audio_length % seg_width)
+    reshaped_audio_abs = audio_abs[:l2].reshape(-1, seg_width) # 区間で２次元配列にする
     max_values = np.max(reshaped_audio_abs, axis=1)
-    max_indices = np.argmax(reshaped_audio_abs, axis=1) + np.arange(0, audio_length - seg_width, seg_width)
+    max_indices = np.argmax(reshaped_audio_abs, axis=1) + np.arange(0, l2, seg_width)
 
     # 音声全体の最大値を見つける
     audio_max = np.max(max_values)
@@ -173,7 +174,8 @@ class VoskProcessor:
 
     def __init__(self, threshold:float, audio_log:str|None=None):
         vosk.SetLogLevel(-1)
-        self.threshold:float = threshold
+        self.sec_threshold:float = 0.8
+        self.signal_threshold:float = threshold
         self.audio_log:str|None = audio_log
         if audio_log:
             lock_dir = os.path.join(audio_log,'.lock')
@@ -183,7 +185,9 @@ class VoskProcessor:
         self.audio_norm = 2
 
     def process_audiof(self,input_data:NDArray[np.float32],sr:int) ->dict:
-        self.saveto(input_data,sr)
+        sec = round( len(input_data)/sr,3)
+        if sec>self.sec_threshold:
+            self.saveto(input_data,sr)
         if sr != vosk_sr:
             input_data2 = librosa.resample( input_data, orig_sr=sr, target_sr=vosk_sr)
         else:
@@ -197,8 +201,10 @@ class VoskProcessor:
                 input_ch = wf.getnchannels()
                 input_sr = wf.getframerate()
                 input_sz = wf.getnframes()
+            sec = round( input_sz/input_sr,3)
             print(f"Request sr:{input_sr}, ch:{input_ch}, sz:{input_sz}")
-            self.saveto(wave_data)
+            if sec>self.sec_threshold:
+                self.saveto(wave_data)
             # 音声データのリサンプリングとモノラル変換
             audio_f32, sr = librosa.load(BytesIO(wave_data), sr=vosk_sr, mono=True)
             return self._process_audio(audio_f32)
@@ -235,13 +241,13 @@ class VoskProcessor:
 
             sec = round( len(audio_f32) / vosk_sr , 3 )
             resp['audio_sec'] = sec
-            if sec<0.2:
+            if sec<self.sec_threshold:
                 resp["error"]="Audio is short"
                 return resp
             audio_abs = np.abs(audio_f32)
             lv_max = np.max(audio_abs)
             resp['lv_max'] = round( float(lv_max),4)
-            if lv_max<self.threshold:
+            if lv_max<self.signal_threshold:
                 resp["error"]="Audio is silent"
                 return resp
             # ゼロでない要素のインデックスを取得
@@ -255,7 +261,7 @@ class VoskProcessor:
             audio_f32 = audio_f32[start:end]
 
             target_lv = 32767 * 0.8
-            audio_f32 = nomlize_audio( audio_f32, vosk_sr, target_lv=target_lv )
+            audio_f32 = nomlize_audio( audio_f32, vosk_sr, target_lv=target_lv, signal_threshold=self.signal_threshold )
             audio_bytes = audio_f32.astype(np.int16).tobytes()
             audio_bz = len(audio_bytes)
             block_size = 4000
@@ -410,7 +416,7 @@ def test_recognition( *, url:str ):
             elaps_time = time.time() - st
 
             if response.status_code == 200:
-                print(f"Recognition results: {w} {elaps_time:.3f}(sec)")
+                print(f"Recognition results: {w} elaps:{elaps_time:.3f}(sec)")
                 print(response.json())
             else:
                 print(f"Error: {w} {response.status_code}")
@@ -493,5 +499,5 @@ def test_anti_fadein():
     dbg_plot( 'tmp/dbgaudio05.png', title=f'normalized audio', audio=audio_x5, norm_audio=norm_audio, marker=marker )
 
 if __name__ == "__main__":
-    test_main()
-    #test_anti_fadein()
+    #test_main()
+    test_anti_fadein()
