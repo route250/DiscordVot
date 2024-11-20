@@ -8,6 +8,7 @@ import threading
 import time
 import librosa
 import numpy as np
+from scipy.signal import find_peaks
 from scipy.stats import norm
 from io import BytesIO
 from concurrent.futures import ProcessPoolExecutor
@@ -17,6 +18,7 @@ import traceback
 import re
 import asyncio
 import tempfile
+from numpy.typing import NDArray
 
 
 # Flaskアプリケーション
@@ -32,35 +34,134 @@ VOSK_IGNORE_WARDS = {
 }
 VOSK_NOIZE='<|noize|>'
 
+def moving_ave( array:NDArray[np.float32], window_size ) ->tuple[NDArray[np.float32],NDArray[np.float32]]:
+    padding = window_size // 2
+    window_size = padding*2 + 1
 
-# ベクトル化されたaaaa関数
-def audio_normalize( x: np.ndarray, ix:float, xmax:float, iy:float, ymax:float ) -> np.ndarray:
+    padding_np1 = np.zeros( padding+1, dtype=array.dtype )
+    padding_np1[:] = array[0]
+    padding_np2 = np.zeros( padding, dtype=array.dtype )
+    padding_np2[:] = array[-1]
+    padd_array = np.concatenate( (padding_np1, array, padding_np2 ) )
+    cumsum = np.cumsum(padd_array)
+    np_sum = cumsum[window_size:] - cumsum[:-window_size] 
+    np_ave = np_sum / window_size
+    return np_sum,np_ave
 
-    dx1 = iy / ix
-    dx2 = (ymax - iy) / (xmax - ix)
+def audio_aaa( audio:NDArray[np.float32], sr:int, w:float=0.2, threshold:float=1e-3 ):
+    audio_abs = np.abs(audio)
+    # 音の開始点
+    zero_up_idx = np.where( (audio_abs[:-1] <= threshold) & (audio_abs[1:]>threshold))[0]
+    zero_up_idx += 1
 
-    # 条件を満たすインデックスを取得
-    abs_x = np.abs(x)
-    condition = abs_x < ix
-    
-    # numpy配列を用意
-    y = np.empty_like(abs_x)
+def nomlize_audio( audio:NDArray[np.float32], sr:int, target_lv:float=0.8 ) ->NDArray[np.float32]:
+    coef, _,_ = generate_peak_coefficients( audio, sr )
+    a = audio *coef
+    max_lv = np.max(np.abs(a))
+    r = target_lv / max_lv
+    return a*r
 
-    # 条件に基づいて計算
-    y[condition] = abs_x[condition] * dx1
-    y[~condition] = iy + (abs_x[~condition] - ix) * dx2
-    
-    return y * np.sign(x)
+def generate_peak_coefficients(audio: NDArray[np.float32], sr: int, seg: float = 0.02, dbg:bool=False) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+    audio_length: int = len(audio)
+    seg_width: int = int(sr * seg)  # サンプリングレートと区間の長さに基づいて、区間の幅をサンプル数で計算
+
+    # 音声信号の絶対値を取得して振幅を扱う
+    audio_abs = np.abs(audio)
+
+    # 各区間内の最大値を見つける (ループをnumpy演算に変更して高速化)
+    reshaped_audio_abs = audio_abs[:audio_length - (audio_length % seg_width)].reshape(-1, seg_width)
+    max_values = np.max(reshaped_audio_abs, axis=1)
+    max_indices = np.argmax(reshaped_audio_abs, axis=1) + np.arange(0, audio_length - seg_width, seg_width)
+
+    # 音声全体の最大値を見つける
+    audio_max = np.max(max_values)
+
+    # 係数の配列を初期化
+    coef = np.ones(audio_length, dtype=np.float32)  # 係数配列を1で初期化
+
+    # デバッグ用に区間ごとの最大値を保存する配列を作成
+    if dbg:
+        audio_lvs = np.repeat(max_values, seg_width)  # numpyのrepeatを使って各区間の最大値を全体に広げる
+        audio_lvs = np.concatenate((audio_lvs, np.full(audio_length - len(audio_lvs), max_values[-1])))  # 残りの部分に最大値を埋める
+    else:
+        audio_lvs = coef
+
+    # ピーク検出のしきい値としてピークリミットを決定
+    peak_limit = audio_max / 8
+
+    # ピークリミットを超える最大値の中でピークを見つける
+    peaks, props = find_peaks(max_values, height=peak_limit)
+
+    if dbg:
+        # マーカーの配列を初期化
+        marker = np.full(audio_length, peak_limit, dtype=np.float32)  # マーカー配列をピークリミットの値で初期化
+        for i in peaks:
+            marker[max_indices[i]] = audio_max  # 検出されたピークをマーカー配列にマーク
+    else:
+        marker = coef
+
+    # 有意なピークがない場合、デフォルトの係数配列を返す
+    if len(peaks) <= 1:
+        return coef, audio_lvs, marker
+
+    # 検出されたピークを繰り返し処理して係数を計算
+    before_idx = 0
+    before_rate = audio_max / max_values[peaks[0]]  # 最初のピークに基づく初期レート
+    for i in peaks:
+        idx = max_indices[i]  # 元の音声でのピークのインデックスを取得
+        peak_lv = max_values[i]  # ピークのレベルを取得
+        rate = audio_max / peak_lv  # 正規化のためのレートを計算
+        u = np.linspace(before_rate, rate, idx - before_idx)  # 前のレートと現在のレートの間を線形補間
+        coef[before_idx:idx] = u  # 補間値を係数配列に割り当て
+        coef[idx] = rate  # ピークインデックスに現在のレートを設定
+        before_idx = idx  # 前のインデックスを現在のインデックスに更新
+        before_rate = rate  # 前のレートを現在のレートに更新
+
+    # 最後のピークの後に残っているサンプルがあれば、その係数を設定
+    if before_idx < audio_length:
+        coef[before_idx:] = before_rate
+
+    return coef, audio_lvs, marker
+
+def load_wave_file( file ) ->tuple[NDArray[np.float32],int]:
+    with wave.open(file,'rb') as wf:
+        sr = wf.getframerate()
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        cname = wf.getcompname()
+        ctype = wf.getcomptype()
+        nf = wf.getnframes()
+        sec = round( nf/sr, 3 )
+        print(f"wave:{file} {sec}sec {sr}Hz {ch}ch {sw}byte {cname}")
+        if ctype != 'NONE':
+            raise Exception(f"can not read {cname}: {file}")
+        audio_f32 = np.zeros( nf, dtype=np.float32 )
+        block_size:int = 8192
+        for i in range(0,nf,block_size):
+            bz = min( nf-i, block_size)
+            audio_bytes = wf.readframes(bz)
+            seg = np.frombuffer(audio_bytes,dtype=np.int16).reshape( (-1,ch) )[:,0].astype(np.float32) / 32768.0
+            np.copyto( audio_f32[i:i+bz], seg )
+    return audio_f32,sr
+
+def save_wave_file( file, audio:NDArray[np.float32], sr ):
+    with wave.open(file,'wb') as wf:
+        wf.setframerate(sr)
+        wf.setsampwidth(2)
+        wf.setnchannels(1)
+        wf.setnframes(len(audio))
+        by = (audio*32767).astype(np.int16).tobytes()
+        wf.writeframes(by)
 
 class VoskProcessor:
 
     @staticmethod
-    def process_wave_in_process(input_data):
+    def process_wave_in_process(input_data:bytes):
         global processor
         return processor.process_wave(input_data)
 
     @staticmethod
-    def process_audio_in_process(input_data,sr):
+    def process_audio_in_process(input_data:NDArray[np.float32],sr):
         global processor
         return processor.process_audiof(input_data,sr)
 
@@ -79,8 +180,9 @@ class VoskProcessor:
             os.makedirs(lock_dir,exist_ok=True)
             os.removedirs(lock_dir)
         self.recognizer = KaldiRecognizer(model, vosk_sr)
+        self.audio_norm = 2
 
-    def process_audiof(self,input_data:np.ndarray,sr:int) ->dict:
+    def process_audiof(self,input_data:NDArray[np.float32],sr:int) ->dict:
         self.saveto(input_data,sr)
         if sr != vosk_sr:
             input_data2 = librosa.resample( input_data, orig_sr=sr, target_sr=vosk_sr)
@@ -88,7 +190,7 @@ class VoskProcessor:
             input_data2 = input_data
         return self._process_audio(input_data2)
 
-    def process_wave(self,wave_data) ->dict:
+    def process_wave(self,wave_data:bytes) ->dict:
         # ログ出力
         try:
             with wave.open(BytesIO(wave_data), "rb") as wf:
@@ -124,7 +226,7 @@ class VoskProcessor:
             return VOSK_NOIZE
         return text
 
-    def _process_audio(self,audio_f32) ->dict:
+    def _process_audio(self,audio_f32:NDArray[np.float32]) ->dict:
         """
         音声を処理して認識結果を返す
         """
@@ -151,32 +253,18 @@ class VoskProcessor:
             start, end = non_zero_indices[0], non_zero_indices[-1] + 1
             resp['voice_sec'] = round( (end-start)/vosk_sr, 4 )
             audio_f32 = audio_f32[start:end]
-            audio_abs = audio_abs[start:end]
-            # 音量を計算
-            x = lv_max*0.2
-            non_zero = audio_abs[audio_abs>= 1e-9]
-            audio_abs2 = non_zero[non_zero<x]
-            lv_mean = np.mean(audio_abs2)
-            lv_std_dev = np.std(audio_abs2)
-            lv2 = norm.ppf(0.8, loc=lv_mean, scale=lv_std_dev)
-            lv=float(lv2)
-            resp['lv_mean'] = round( float(lv),4)
-            if lv<self.threshold:
-                resp["error"]="Audio is silent"
-                return resp
-            print(f"audio range {lv_max:.3f}-{lv_std_dev:.3f} mean:{lv_mean:.3f} lv:{lv:.3f}")
-            target_lv = 32767 * 0.6
-            audio_f32 = audio_normalize(audio_f32, lv, lv_max, target_lv*0.2, target_lv )
-            audio_f32 = np.clip(-32767,32767,audio_f32)
 
+            target_lv = 32767 * 0.8
+            audio_f32 = nomlize_audio( audio_f32, vosk_sr, target_lv=target_lv )
             audio_bytes = audio_f32.astype(np.int16).tobytes()
-
+            audio_bz = len(audio_bytes)
+            block_size = 4000
             # Voskで音声認識
             raw_results = []
 
-            for i in range(0, len(audio_bytes), 4000):
-                data = audio_bytes[i:i+4000]
-                if self.recognizer.AcceptWaveform(data):
+            for st in range(0, len(audio_bytes), block_size):
+                ed = min(st+block_size,audio_bz)
+                if self.recognizer.AcceptWaveform(audio_bytes[st:ed]):
                     text = self._get_text_from_result( self.recognizer.Result())
                     if text:
                         raw_results.append(text)
@@ -239,13 +327,9 @@ class VoskProcessor:
                     if isinstance(data,bytes):
                         with open(wave_path,'wb') as wf:
                             wf.write(data)
-                    elif isinstance(data,np.ndarray):
-                        with wave.open(wave_path, 'wb') as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(sr if isinstance(sr,int) else vosk_sr)
-                            i16 = (data*32767).astype(np.int16).tobytes()
-                            wf.writeframes(i16)
+                    elif isinstance(data,np.ndarray) and data.dtype==np.float32:
+                        save_wave_file( wave_path, data, sr if isinstance(sr,int) else vosk_sr)
+
                 finally:
                     if os.path.exists(lock_dir):
                         os.removedirs(lock_dir)
@@ -297,21 +381,17 @@ class SttServer(Flask):
         result = self.executor.submit(input_data)
         return jsonify(result)
 
-# サーバーのURL
-SERVER_URL = "http://127.0.0.1:5007/recognize"
-AUDIO_FILE_PATH = "tmp/audio0001.wav"
-
-def start_server():
+def start_server( *, host:str="0.0.0.0", port:int=5007):
     """
     Flaskサーバーをバックグラウンドで起動
     """
     app = SttServer(__name__, threshold=0.02)
-    server_thread = threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5007, debug=False, use_reloader=False))
+    server_thread = threading.Thread(target=lambda: app.run(host=host, port=port, debug=False, use_reloader=False))
     server_thread.daemon = True  # プロセス終了時にスレッドも終了
     server_thread.start()
     return server_thread
 
-def test_recognition():
+def test_recognition( *, url:str ):
     """
     Flaskサーバーに音声ファイルを送信して認識結果を取得
     """
@@ -326,7 +406,7 @@ def test_recognition():
 
             files = {"audio": BytesIO(wav_bytes)}
             st = time.time()
-            response = requests.post(SERVER_URL, files=files)
+            response = requests.post(url, files=files)
             elaps_time = time.time() - st
 
             if response.status_code == 200:
@@ -338,16 +418,80 @@ def test_recognition():
     except Exception as e:
         print(f"An error occurred during the test: {e}")
 
-if __name__ == "__main__":
+def test_main():
+
+    host='127.0.0.1'
+    port=5007
+    SERVER_URL = f"http://{host}:{port}/recognize"
+
     # サーバー起動
-    server_thread = start_server()
+    server_thread = start_server( host=host, port=port )
 
     # サーバーが完全に起動するまで少し待つ
     time.sleep(2)
 
     # テストを実行
-    test_recognition()
+    test_recognition( url=SERVER_URL )
 
     # サーバーを停止
     if server_thread.is_alive():
         print("Server thread is still running.")
+
+def dbg_plot( pngfile, *, audio, norm_audio=None, levels=None, marker=None, coef=None, title=None, ylim:bool=False  ):
+    import matplotlib.pyplot as plt
+    plt.clf()
+    fig, ax1 = plt.subplots( figsize=(13,7),dpi=300)
+    if title:
+        plt.title(title)
+    if levels is not None:
+        x = range(len(levels))
+        ax1.fill_between( x, -levels, levels, alpha=0.2, color=None, edgecolor="black", label='signal level')
+    if audio is not None:
+        ax1.plot(audio, alpha=0.2, color='green', label='audio')
+    if norm_audio is not None:
+        ax1.plot(norm_audio, alpha=0.2, color='blue', label='norm audio')
+    if marker is not None:
+        ax1.plot(marker, alpha=0.2, color='red', label='marker')
+    ax1.legend(loc='upper left')
+    # ax1.plot(audio_lv)
+    # ax1.plot(lv_ave)
+    if ylim:
+        ax1.set_ylim(-1,1)
+    if coef is not None:
+        ax2 = ax1.twinx()
+        ax2.plot( coef, alpha=0.6, color='orange', label='coefficient' )
+        ax2.legend(loc='upper right')
+    plt.savefig( pngfile )
+    plt.close()
+
+def test_anti_fadein():
+
+    file = 'tmp/audio/audio0002.wav'
+    file = 'tmp/audio/audio0005.wav'
+    #file = 'tmp/audio/audio0010.wav'
+    #file = 'tmp/audio/audio0002.wav'
+    audio_raw, sr = load_wave_file(file)
+    dbg_plot( 'tmp/dbgaudio00.png', title='raw signal', audio=audio_raw, ylim=True)
+    raw_lv = np.max( np.abs(audio_raw) )
+    rate = round( 0.99/raw_lv, 2 )
+    audio_x5 = audio_raw * rate
+    save_wave_file( 'tmp/dbgaudio1.wav', audio_x5, sr )
+    dbg_plot( 'tmp/dbgaudio01.png', title='raw signal', audio=audio_raw )
+
+    st=time.time()
+    coef, lvs, marker = generate_peak_coefficients( audio_raw, sr, dbg=True )
+    t = time.time()-st
+    print(f"Time {t:.3f} sec")
+    dbg_plot( 'tmp/dbgaudio02.png', title=f'raw signal with signal level', audio=audio_raw, levels=lvs )
+    dbg_plot( 'tmp/dbgaudio03.png', title=f'raw signal with peak point', audio=audio_raw, marker=marker, levels=lvs )
+    dbg_plot( 'tmp/dbgaudio04.png', title=f'raw signal with coefficient', audio=audio_raw, levels=lvs, coef=coef )
+
+    norm_audio = audio_raw*coef
+    r = 1.0 / np.max(np.abs(norm_audio))
+    norm_audio *= r
+    save_wave_file( 'tmp/dbgaudio5.wav', norm_audio, sr )
+    dbg_plot( 'tmp/dbgaudio05.png', title=f'normalized audio', audio=audio_x5, norm_audio=norm_audio, marker=marker )
+
+if __name__ == "__main__":
+    test_main()
+    #test_anti_fadein()
